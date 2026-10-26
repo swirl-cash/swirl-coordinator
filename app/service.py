@@ -48,11 +48,15 @@ class Coordinator:
         self.cfg = config or Config()
         self._randbelow = randbelow
         self._clock = clock
+        # permanent append-only tree, replayed from the leaf table on boot
+        self.tree = merkle.AppendOnlyTree()
+        for c in self.store.leaves_in_order():
+            self.tree.insert(c)
 
     # ── public params ────────────────────────────────────────
     def params(self) -> dict:
         return {
-            "version": "0.2.0",
+            "version": "0.3.0",
             "lattice_sats": list(lattice.LATTICE),
             "fee_bps": self.cfg.fee_bps,
             "min_hold_seconds": self.cfg.min_hold,
@@ -89,10 +93,14 @@ class Coordinator:
             "pubkey": pubkey_hex, "state": "AWAITING_PAYMENT",
             "invoice": invoice, "invoice_label": label, "created_at": now,
         })
+        leaf_index, root = self.tree.insert(commitment)
+        self.store.add_leaf(commitment, amount_sats, leaf_index, root)
         return {
             "commitment": commitment,
             "invoice": invoice,
             "amount_sats": amount_sats,
+            "leaf_index": leaf_index,
+            "merkle_root": root,
             "expires_at": now + self.cfg.invoice_expiry,
             "min_hold_seconds": self.cfg.min_hold,
         }
@@ -113,7 +121,8 @@ class Coordinator:
                 )
 
     # ── payout authorization ─────────────────────────────────
-    def authorize_payout(self, commitment: str, pubkey_hex: str, offer: str,
+    def authorize_payout(self, commitment: str, root: str, nullifier_hash: str,
+                         pubkey_hex: str, offer: str,
                          fee_bps: int, signature_hex: str) -> dict:
         d = self.store.get(commitment)
         if not d:
@@ -122,27 +131,35 @@ class Coordinator:
             raise ServiceError("not_payable", f"deposit is {d['state']}", 409)
         if d["state"] == "QUEUED":
             raise ServiceError("already_queued", "payout already authorized", 409)
+        if not self.store.is_known_root(root):
+            # tornado rule: only a recent root is acceptable
+            raise ServiceError("unknown_root",
+                               "root is not in the recent root history", 409)
         if not offer or len(offer) > 1024 or any(c.isspace() for c in offer):
             raise ServiceError("bad_offer", "invalid BOLT12 offer", 422)
         if fee_bps != self.cfg.fee_bps:
             raise ServiceError("fee_mismatch",
                                f"current fee is {self.cfg.fee_bps} bps", 422)
         if not receipts.verify_authorization(
-            commitment, pubkey_hex, signature_hex, offer, d["amount_sats"], fee_bps
+            commitment, root, nullifier_hash, pubkey_hex, signature_hex,
+            offer, d["amount_sats"], fee_bps,
         ):
             raise ServiceError("bad_signature",
-                               "authorization does not match commitment/offer/fee", 401)
+                               "authorization does not match root/nullifier/offer/fee", 401)
 
         oh = receipts.offer_hash(offer)
         jitter = self._randbelow(self.cfg.jitter_max + 1) if self.cfg.jitter_max else 0
         release_at = d["paid_at"] + self.cfg.min_hold + jitter
         payout = lattice.payout_amount(d["amount_sats"])
         result = self.store.queue_payout(
-            commitment, offer, oh, release_at, fee_bps, payout,
+            commitment, offer, oh, nullifier_hash, release_at, fee_bps, payout,
         )
         if result == "offer_reuse":
             raise ServiceError("offer_reuse",
                                "every exit needs a fresh BOLT12 offer", 409)
+        if result == "nullifier_spent":
+            raise ServiceError("already_spent",
+                               "this note's nullifier has already been spent", 409)
         if result != "ok":
             raise ServiceError("already_queued", "payout already authorized", 409)
         return {
@@ -250,17 +267,20 @@ class Coordinator:
         }
 
     def anonymity_set(self) -> dict:
-        live = self.store.live_commitments()
-        root, _ = merkle.build(live)
-        return {"size": len(live), "merkle_root": root.hex()}
+        # the set is ALL deposits ever — it never shrinks on settlement
+        return {
+            "size": self.tree.next_index,
+            "merkle_root": self.tree.root.hex(),
+            "root_history_size": merkle.ROOT_HISTORY_SIZE,
+        }
 
     def inclusion_proof(self, commitment: str) -> dict:
-        live = self.store.live_commitments()
-        prf = merkle.proof(live, commitment)
-        if prf is None:
-            raise ServiceError("not_in_set", "commitment is not in the live set", 404)
-        root, _ = merkle.build(live)
+        idx = self.store.leaf_index(commitment)
+        if idx is None:
+            raise ServiceError("not_in_set", "commitment is not in the tree", 404)
+        prf = self.tree.path(idx)
         return {
-            "merkle_root": root.hex(),
+            "leaf_index": idx,
+            "merkle_root": self.tree.root.hex(),
             "proof": [{"sibling": s, "side": side} for s, side in prf],
         }

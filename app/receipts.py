@@ -1,17 +1,24 @@
-"""Receipts and payout authorizations.
+"""Receipts and withdrawal authorizations — Tornado's input structure.
 
-Deposit side (on the user's device, e.g. CLI or web wallet):
-    sk = secrets.token_bytes(32)
-    pk = schnorr.pubkey(sk)
-    commitment = make_commitment(pk, amount_sats)
-The user sends only (amount, pk) to the coordinator and keeps a receipt:
+Receipt (generated and kept on the user's device):
     SWIRL1-<amount_sats>-<seckey hex>
+From the secret key we derive:
+    pubkey        = schnorr.pubkey(sk)                     (spending key)
+    commitment    = sha256("SWIRL1/commitment" | pubkey | amount)
+    nullifier     = sha256("SWIRL1/nullifier-seed" | sk)
+    nullifierHash = sha256("SWIRL1/nullifier" | nullifier)
 
-Payout side: the user signs an authorization binding the exact payout terms
-    sha256("SWIRL1/payout" | commitment | sha256(offer) | amount | fee_bps)
-and sends (pubkey, signature, offer, fee_bps). The secret key itself is never
-transmitted. The coordinator cannot raise the fee or swap the destination
-offer without invalidating the signature.
+Like Tornado, double-spending is prevented by the NULLIFIER SET, not by the
+deposit state machine: a withdrawal permanently burns nullifierHash.
+
+The withdrawal authorization mirrors the public inputs of tornado's
+withdraw.circom — (root, nullifierHash, recipient, fee) — plus the direct
+mode's commitment:
+    sha256("SWIRL1/withdraw" | commitment | root | nullifierHash |
+           sha256(offer) | amount | fee_bps)
+Changing the root, destination or fee invalidates the signature. When the
+Groth16 path lands, the same tuple becomes the circuit's public input and
+the commitment stops being revealed at all.
 """
 
 from __future__ import annotations
@@ -30,6 +37,14 @@ def make_commitment(pub: bytes, amount_sats: int) -> str:
     ).hexdigest()
 
 
+def nullifier_for(seckey: bytes) -> bytes:
+    return hashlib.sha256(b"SWIRL1/nullifier-seed" + seckey).digest()
+
+
+def nullifier_hash_for(seckey: bytes) -> str:
+    return hashlib.sha256(b"SWIRL1/nullifier" + nullifier_for(seckey)).hexdigest()
+
+
 def encode_receipt(seckey: bytes, amount_sats: int) -> str:
     return f"SWIRL1-{amount_sats}-{seckey.hex()}"
 
@@ -41,32 +56,34 @@ def decode_receipt(receipt: str) -> tuple[bytes, int]:
     return bytes.fromhex(m.group(2)), int(m.group(1))
 
 
-def auth_digest(commitment: str, offer: str, amount_sats: int, fee_bps: int) -> bytes:
+def auth_digest(commitment: str, root: str, nullifier_hash: str,
+                offer: str, amount_sats: int, fee_bps: int) -> bytes:
     return hashlib.sha256(
-        b"SWIRL1/payout"
+        b"SWIRL1/withdraw"
         + bytes.fromhex(commitment)
+        + bytes.fromhex(root)
+        + bytes.fromhex(nullifier_hash)
         + hashlib.sha256(offer.encode()).digest()
         + amount_sats.to_bytes(8, "big")
         + fee_bps.to_bytes(4, "big")
     ).digest()
 
 
-def sign_authorization(
-    receipt: str, commitment: str, offer: str, fee_bps: int
-) -> tuple[str, str]:
-    """User-side helper: returns (pubkey_hex, signature_hex)."""
+def sign_authorization(receipt: str, commitment: str, root: str,
+                       offer: str, fee_bps: int) -> tuple[str, str, str]:
+    """User-side helper: returns (pubkey_hex, nullifier_hash_hex, signature_hex)."""
     sk, amount = decode_receipt(receipt)
     pk = schnorr.pubkey(sk)
     if make_commitment(pk, amount) != commitment:
         raise ValueError("receipt does not match this commitment")
-    sig = schnorr.sign(auth_digest(commitment, offer, amount, fee_bps), sk)
-    return pk.hex(), sig.hex()
+    nh = nullifier_hash_for(sk)
+    sig = schnorr.sign(auth_digest(commitment, root, nh, offer, amount, fee_bps), sk)
+    return pk.hex(), nh, sig.hex()
 
 
-def verify_authorization(
-    commitment: str, pub_hex: str, sig_hex: str,
-    offer: str, amount_sats: int, fee_bps: int,
-) -> bool:
+def verify_authorization(commitment: str, root: str, nullifier_hash: str,
+                         pub_hex: str, sig_hex: str,
+                         offer: str, amount_sats: int, fee_bps: int) -> bool:
     try:
         pub = bytes.fromhex(pub_hex)
         sig = bytes.fromhex(sig_hex)
@@ -75,7 +92,8 @@ def verify_authorization(
     if make_commitment(pub, amount_sats) != commitment:
         return False
     return schnorr.verify(
-        auth_digest(commitment, offer, amount_sats, fee_bps), pub, sig
+        auth_digest(commitment, root, nullifier_hash, offer, amount_sats, fee_bps),
+        pub, sig,
     )
 
 

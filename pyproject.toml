@@ -1,6 +1,6 @@
 [project]
 name = "swirl-coordinator"
-version = "0.2.0"
+version = "0.3.0"
 description = "SWIRL pool coordinator — non-custodial, fixed-denomination mixing over Lightning. Anyone can run one."
 requires-python = ">=3.11"
 dependencies = ["fastapi>=0.115,<1", "uvicorn[standard]>=0.30,<1", "pydantic>=2,<3"]

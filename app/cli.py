@@ -57,10 +57,12 @@ def main():
         if name == "payout":
             c.add_argument("--commitment", required=True)
             c.add_argument("--offer", required=True, help="fresh BOLT12 offer")
+            c.add_argument("--root", help="recent merkle root (auto-fetched if omitted)")
 
     sg = sub.add_parser("sign", help="sign a payout authorization offline")
     sg.add_argument("--receipt", required=True)
     sg.add_argument("--commitment", required=True)
+    sg.add_argument("--root", required=True)
     sg.add_argument("--offer", required=True)
     sg.add_argument("--fee-bps", type=int, default=lattice.FEE_BPS)
 
@@ -89,15 +91,18 @@ def main():
         print(json.dumps(res, indent=2))
 
     elif a.cmd == "sign":
-        pk, sig = receipts.sign_authorization(a.receipt, a.commitment, a.offer, a.fee_bps)
-        print(json.dumps({"pubkey": pk, "signature": sig}, indent=2))
+        pk, nh, sig = receipts.sign_authorization(
+            a.receipt, a.commitment, a.root, a.offer, a.fee_bps)
+        print(json.dumps({"pubkey": pk, "nullifier_hash": nh, "signature": sig}, indent=2))
 
     elif a.cmd == "payout":
         fee = _fee_bps(a.api)
-        pk, sig = receipts.sign_authorization(a.receipt, a.commitment, a.offer, fee)
+        root = a.root or _api(a.api, "/v1/mix/set")["merkle_root"]
+        pk, nh, sig = receipts.sign_authorization(
+            a.receipt, a.commitment, root, a.offer, fee)
         res = _api(a.api, "/v1/mix/payout", {
-            "commitment": a.commitment, "pubkey": pk,
-            "offer": a.offer, "fee_bps": fee, "signature": sig,
+            "commitment": a.commitment, "root": root, "nullifier_hash": nh,
+            "pubkey": pk, "offer": a.offer, "fee_bps": fee, "signature": sig,
         })
         print(json.dumps(res, indent=2))
 

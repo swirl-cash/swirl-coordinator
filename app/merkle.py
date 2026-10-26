@@ -1,63 +1,98 @@
-"""Merkle tree over held commitments.
+"""Append-only Merkle tree with root history — the Tornado model.
 
-Every deposit that is currently inside the pool is a leaf. Publishing the
-root lets anyone verify that a commitment is (or is not) part of the live
-anonymity set — and is the hook federated coordinators will later merge
-their trees through.
+Two properties copied deliberately from MerkleTreeWithHistory.sol:
+
+  * the tree is PERMANENT. Settled deposits are never removed, so the
+    anonymity set only ever grows. (Rebuilding a tree of "currently held"
+    deposits would shrink the crowd with every withdrawal — a design bug.)
+  * the last ROOT_HISTORY_SIZE roots stay valid. A withdrawal may reference
+    any recent root, so observers cannot correlate "root used" with
+    "deposit made just before the withdrawal".
+
+Hashing is SHA-256 (domain-separated) for now; the structure is exactly the
+one a Groth16 membership proof will later be generated against.
 """
 
 from __future__ import annotations
 
 import hashlib
 
+LEVELS = 20                      # same depth as tornado's Withdraw(20)
+ROOT_HISTORY_SIZE = 30           # same as ROOT_HISTORY_SIZE in the contract
+
 
 def _h(a: bytes, b: bytes) -> bytes:
-    return hashlib.sha256(a + b).digest()
+    return hashlib.sha256(b"SWIRL1/node" + a + b).digest()
 
 
 def leaf(commitment_hex: str) -> bytes:
     return hashlib.sha256(b"SWIRL1/leaf" + bytes.fromhex(commitment_hex)).digest()
 
 
-def build(commitments: list[str]) -> tuple[bytes, list[list[bytes]]]:
-    """Returns (root, levels). Empty set commits to sha256 of a fixed tag."""
-    if not commitments:
-        return hashlib.sha256(b"SWIRL1/empty").digest(), []
-    level = [leaf(c) for c in sorted(commitments)]
-    levels = [level]
-    while len(level) > 1:
-        nxt = []
-        for i in range(0, len(level), 2):
-            a = level[i]
-            b = level[i + 1] if i + 1 < len(level) else a
-            nxt.append(_h(a, b))
-        levels.append(nxt)
-        level = nxt
-    return levels[-1][0], levels
-
-
-def proof(commitments: list[str], commitment_hex: str) -> list[tuple[str, str]] | None:
-    """Merkle inclusion proof as [(sibling_hex, 'L'|'R'), ...]."""
-    if commitment_hex not in commitments:
-        return None
-    ordered = sorted(commitments)
-    idx = ordered.index(commitment_hex)
-    _, levels = build(commitments)
-    out: list[tuple[str, str]] = []
-    for level in levels[:-1]:
-        sib = idx ^ 1
-        if sib < len(level):
-            sibling = level[sib]
-            side = "L" if idx % 2 == 1 else "R"
-        else:
-            sibling = level[idx]
-            side = "R"
-        out.append((sibling.hex(), side))
-        idx //= 2
+def _zeros() -> list[bytes]:
+    out = [hashlib.sha256(b"SWIRL1/zero").digest()]
+    for _ in range(LEVELS):
+        out.append(_h(out[-1], out[-1]))
     return out
 
 
-def verify_proof(commitment_hex: str, prf: list[tuple[str, str]], root_hex: str) -> bool:
+class AppendOnlyTree:
+    """Incremental tree, O(levels) per insert, replayable from leaf order.
+    Leaves are retained so membership paths can be served directly."""
+
+    def __init__(self):
+        self.zeros = _zeros()
+        self.filled: list[bytes] = list(self.zeros)
+        self.leaves: list[bytes] = []
+        self.next_index = 0
+        self.root = self.zeros[LEVELS]
+
+    def insert(self, commitment_hex: str) -> tuple[int, str]:
+        """Returns (leaf_index, new_root_hex)."""
+        if self.next_index >= 2 ** LEVELS:
+            raise RuntimeError("merkle tree is full")
+        index = self.next_index
+        current = leaf(commitment_hex)
+        self.leaves.append(current)
+        i = index
+        for level in range(LEVELS):
+            if i % 2 == 0:
+                left, right = current, self.zeros[level]
+                self.filled[level] = current
+            else:
+                left, right = self.filled[level], current
+            current = _h(left, right)
+            i //= 2
+        self.next_index += 1
+        self.root = current
+        return index, current.hex()
+
+    def _node(self, level: int, index: int) -> bytes:
+        start = index * (2 ** level)
+        if start >= len(self.leaves):
+            return self.zeros[level]
+        if level == 0:
+            return self.leaves[index]
+        return _h(self._node(level - 1, index * 2),
+                  self._node(level - 1, index * 2 + 1))
+
+    def path(self, index: int) -> list[tuple[str, str]]:
+        """Merkle path against the CURRENT root, [(sibling_hex, 'L'|'R')].
+        'L' means the sibling sits on the left of the walking node."""
+        if not 0 <= index < self.next_index:
+            raise IndexError("leaf index out of range")
+        out: list[tuple[str, str]] = []
+        i = index
+        for level in range(LEVELS):
+            sibling = self._node(level, i ^ 1)
+            out.append((sibling.hex(), "L" if i % 2 == 1 else "R"))
+            i //= 2
+        return out
+
+
+def verify_path(commitment_hex: str, prf: list[tuple[str, str]], root_hex: str) -> bool:
+    if len(prf) != LEVELS:
+        return False
     node = leaf(commitment_hex)
     for sib_hex, side in prf:
         sib = bytes.fromhex(sib_hex)

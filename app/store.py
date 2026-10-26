@@ -34,6 +34,24 @@ CREATE TABLE IF NOT EXISTS used_offers (
     offer_hash TEXT PRIMARY KEY,
     used_at    INTEGER NOT NULL
 );
+-- permanent deposit leaves: settled deposits are NEVER removed (the
+-- anonymity set only grows, exactly like Tornado's on-chain tree)
+CREATE TABLE IF NOT EXISTS leaves (
+    commitment  TEXT PRIMARY KEY,
+    leaf_index  INTEGER UNIQUE NOT NULL,
+    amount_sats INTEGER NOT NULL,
+    created_at  INTEGER NOT NULL
+);
+-- rolling history of recent roots; the last 30 are valid for withdrawals
+CREATE TABLE IF NOT EXISTS roots (
+    id   INTEGER PRIMARY KEY AUTOINCREMENT,
+    root TEXT NOT NULL
+);
+-- spent nullifiers: double-spend prevention independent of deposit state
+CREATE TABLE IF NOT EXISTS nullifiers (
+    nullifier_hash TEXT PRIMARY KEY,
+    spent_at       INTEGER NOT NULL
+);
 """
 
 # states in which a commitment is part of the live anonymity set
@@ -109,14 +127,38 @@ class Store:
             for r in self._q(f"SELECT commitment FROM deposits WHERE state IN ({marks})", LIVE_STATES)
         ]
 
+    # ── permanent merkle leaves + root history ───────────────
+    def add_leaf(self, commitment: str, amount_sats: int,
+                 leaf_index: int, root: str):
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO leaves (commitment, leaf_index, amount_sats, created_at)"
+                " VALUES (?, ?, ?, ?)",
+                (commitment, leaf_index, amount_sats, int(time.time())),
+            )
+            self._conn.execute("INSERT INTO roots (root) VALUES (?)", (root,))
+            self._conn.commit()
+
+    def leaves_in_order(self) -> list[str]:
+        return [r["commitment"] for r in
+                self._q("SELECT commitment FROM leaves ORDER BY leaf_index")]
+
+    def leaf_index(self, commitment: str) -> int | None:
+        r = self._q("SELECT leaf_index FROM leaves WHERE commitment=?",
+                    (commitment,), "one")
+        return r["leaf_index"] if r else None
+
+    def is_known_root(self, root: str) -> bool:
+        return self._q(
+            "SELECT 1 AS x FROM (SELECT root FROM roots ORDER BY id DESC LIMIT 30)"
+            " WHERE root=?", (root,), "one") is not None
+
     # ── payout queueing (single atomic transaction) ─────────
     def queue_payout(self, commitment: str, offer: str, offer_hash: str,
+                     nullifier_hash: str,
                      release_at: int, fee_bps: int, payout_sats: int) -> str:
-        """Burn the single-use offer AND move HELD→QUEUED atomically.
-
-        BEGIN IMMEDIATE makes the check-and-write race-free across processes
-        (API + payout worker share this file; do not scale the API beyond
-        one process). Returns 'ok' | 'offer_reuse' | 'state'.
+        """Burn the single-use offer AND the nullifier AND move HELD→QUEUED
+        atomically. Returns 'ok' | 'offer_reuse' | 'nullifier_spent' | 'state'.
         If anything fails, NOTHING is burned and the deposit stays HELD.
         """
         with self._lock:
@@ -127,6 +169,11 @@ class Store:
                 ).fetchone():
                     self._conn.execute("ROLLBACK")
                     return "offer_reuse"
+                if self._conn.execute(
+                    "SELECT 1 FROM nullifiers WHERE nullifier_hash=?", (nullifier_hash,)
+                ).fetchone():
+                    self._conn.execute("ROLLBACK")
+                    return "nullifier_spent"
                 cur = self._conn.execute(
                     """UPDATE deposits
                        SET state='QUEUED', release_at=?, offer=?, offer_hash=?,
@@ -140,6 +187,10 @@ class Store:
                 self._conn.execute(
                     "INSERT INTO used_offers (offer_hash, used_at) VALUES (?, ?)",
                     (offer_hash, int(time.time())),
+                )
+                self._conn.execute(
+                    "INSERT INTO nullifiers (nullifier_hash, spent_at) VALUES (?, ?)",
+                    (nullifier_hash, int(time.time())),
                 )
                 self._conn.execute("COMMIT")
                 return "ok"

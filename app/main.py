@@ -23,6 +23,8 @@ class DepositReq(BaseModel):
 
 class PayoutReq(BaseModel):
     commitment: str
+    root: str
+    nullifier_hash: str
     pubkey: str
     offer: str = Field(..., min_length=4, max_length=1024)
     fee_bps: int
@@ -38,7 +40,7 @@ def build_app() -> FastAPI:
     coord = Coordinator(
         Store(os.environ.get("SWIRL_DB", "data/swirl.db")), from_env(), cfg,
     )
-    app = FastAPI(title="SWIRL coordinator", version="0.2.0")
+    app = FastAPI(title="SWIRL coordinator", version="0.3.0")
     app.state.coord = coord
 
     @app.exception_handler(ServiceError)
@@ -95,7 +97,8 @@ def build_app() -> FastAPI:
     @app.post("/v1/mix/payout")
     def payout(req: PayoutReq):
         return coord.authorize_payout(
-            req.commitment, req.pubkey, req.offer, req.fee_bps, req.signature,
+            req.commitment, req.root, req.nullifier_hash,
+            req.pubkey, req.offer, req.fee_bps, req.signature,
         )
 
     @app.get("/v1/mix/deposit/{commitment}")

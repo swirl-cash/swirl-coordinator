@@ -4,10 +4,13 @@ Non-custodial, fixed-denomination mixing over Lightning — **software anyone ca
 One coordinator is one node in the network; users can choose their coordinator,
 and federated settlement (shared anonymity sets) is the next milestone.
 
-**Status: v0.2.0 — regtest software. Do not use with real funds.**
-Core protocol logic is unit-tested (24 tests, including the official BIP340
+**Status: v0.3.0 — regtest software. Do not use with real funds.**
+Core protocol logic is unit-tested (30 tests, including the official BIP340
 vectors); the CLN integration is written against the real JSON-RPC API and is
 exercised through the regtest stack below.
+The pool model follows tornado-core: permanent append-only Merkle tree,
+30-root history, nullifier double-spend sets — see
+[docs/TORNADO.md](docs/TORNADO.md) for the exact mapping.
 **Known trust gap:** once a deposit HTLC settles, a vanished coordinator
 cannot be forced to refund. The held-HTLC entry design that closes this is
 specified in [docs/REFUNDS.md](docs/REFUNDS.md) and is the next milestone.
@@ -22,7 +25,8 @@ specified in [docs/REFUNDS.md](docs/REFUNDS.md) and is the next milestone.
 | No instant in-and-out | 60 min minimum hold + up to 15 min random jitter, per deposit |
 | No address reuse | Every exit offer is single-use → `409 offer_reuse` |
 | No double settlement | Atomic compare-and-set state transitions, `SETTLING` guard, retry on failure |
-| Verifiable anonymity set | Merkle root + inclusion proofs of all live commitments |
+| Verifiable anonymity set | Permanent append-only Merkle tree (20 levels), 30-root history, inclusion proofs — the set never shrinks on settlement |
+| Double-spend protection | Nullifier set, burned atomically with the payout queue — `409 already_spent` is final |
 | Destination hygiene | Plaintext offers are purged from the DB on settlement; secret keys are never transmitted or stored |
 | Crash-safe settlement | Every payment is appended to an fsync'd journal before the state flip; SETTLING rows reconcile automatically |
 | Real payment timestamps | Holds start at the node's `paid_at`, not the poller's clock |
@@ -88,8 +92,8 @@ coordinator) can authorize your exit.
 | Method | Path | Purpose |
 |---|---|---|
 | GET | `/v1/params` | lattice, fee, hold/jitter, expiry |
-| POST | `/v1/mix/deposit` | `{amount_sats, pubkey}` → invoice + commitment |
-| POST | `/v1/mix/payout` | `{commitment, pubkey, offer, fee_bps, signature}` → `release_at` |
+| POST | `/v1/mix/deposit` | `{amount_sats, pubkey}` → invoice + commitment + leaf_index + merkle_root |
+| POST | `/v1/mix/payout` | `{commitment, root, nullifier_hash, pubkey, offer, fee_bps, signature}` → `release_at` |
 | GET | `/v1/mix/deposit/{commitment}` | state, amounts, release time |
 | GET | `/v1/mix/set` | live anonymity-set size + Merkle root |
 | GET | `/v1/mix/proof/{commitment}` | Merkle inclusion proof |
