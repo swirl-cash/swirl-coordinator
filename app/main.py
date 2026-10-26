@@ -11,6 +11,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
+from . import __version__
 from .lightning import from_env
 from .service import Coordinator, Config, ServiceError
 from .store import Store
@@ -40,7 +41,7 @@ def build_app() -> FastAPI:
     coord = Coordinator(
         Store(os.environ.get("SWIRL_DB", "data/swirl.db")), from_env(), cfg,
     )
-    app = FastAPI(title="SWIRL coordinator", version="0.3.0")
+    app = FastAPI(title="SWIRL coordinator", version=__version__)
     app.state.coord = coord
 
     @app.exception_handler(ServiceError)

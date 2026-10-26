@@ -1,6 +1,4 @@
-"""Append-only Merkle tree with root history — the Tornado model.
-
-Two properties copied deliberately from MerkleTreeWithHistory.sol:
+"""SWIRL append-only Merkle tree with rolling root history.
 
   * the tree is PERMANENT. Settled deposits are never removed, so the
     anonymity set only ever grows. (Rebuilding a tree of "currently held"
@@ -17,8 +15,8 @@ from __future__ import annotations
 
 import hashlib
 
-LEVELS = 20                      # same depth as tornado's Withdraw(20)
-ROOT_HISTORY_SIZE = 30           # same as ROOT_HISTORY_SIZE in the contract
+LEVELS = 20
+ROOT_HISTORY_SIZE = 30
 
 
 def _h(a: bytes, b: bytes) -> bytes:

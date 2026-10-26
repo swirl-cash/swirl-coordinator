@@ -4,13 +4,13 @@ Non-custodial, fixed-denomination mixing over Lightning — **software anyone ca
 One coordinator is one node in the network; users can choose their coordinator,
 and federated settlement (shared anonymity sets) is the next milestone.
 
-**Status: v0.3.0 — regtest software. Do not use with real funds.**
-Core protocol logic is unit-tested (30 tests, including the official BIP340
+**Status: v0.4.0 — regtest software. Do not use with real funds.**
+Core protocol logic is unit-tested (38 tests, including the official BIP340
 vectors); the CLN integration is written against the real JSON-RPC API and is
 exercised through the regtest stack below.
-The pool model follows tornado-core: permanent append-only Merkle tree,
-30-root history, nullifier double-spend sets — see
-[docs/TORNADO.md](docs/TORNADO.md) for the exact mapping.
+The SWIRL core pool uses a permanent append-only Merkle tree, 30-root history
+and nullifier double-spend sets — see [docs/POOL.md](docs/POOL.md) for the
+mechanisms and trust boundaries.
 **Known trust gap:** once a deposit HTLC settles, a vanished coordinator
 cannot be forced to refund. The held-HTLC entry design that closes this is
 specified in [docs/REFUNDS.md](docs/REFUNDS.md) and is the next milestone.
@@ -55,6 +55,19 @@ Without `SWIRL_CLN_RPC` the node uses a mock Lightning backend so the full
 state machine can be exercised locally. Point `SWIRL_CLN_RPC` at a real CLN
 socket to go live on regtest.
 
+## Asset backends
+
+`SWIRL_ASSET_BACKEND=btc` is the default and preserves the existing CLN/mock
+behavior. `SWIRL_ASSET_BACKEND=rgb` selects the explicit RGB adapter boundary,
+which is **disabled**: `/v1/params` reports `enabled: false` and deposit
+requests fail with `503 asset_backend_unavailable`. No RGB invoice or payout
+is attempted.
+
+One coordinator serves one asset. BTC and future RGB pools must use separate
+databases, Merkle trees, nullifier sets and asset-specific denomination
+configuration. See [docs/ASSETS.md](docs/ASSETS.md) for the interface and the
+work required before RGB can be enabled.
+
 ## Run the full regtest stack (bitcoind + CLN + coordinator)
 
 ```bash
@@ -91,7 +104,7 @@ coordinator) can authorize your exit.
 
 | Method | Path | Purpose |
 |---|---|---|
-| GET | `/v1/params` | lattice, fee, hold/jitter, expiry |
+| GET | `/v1/params` | asset capabilities, lattice, fee, hold/jitter, expiry |
 | POST | `/v1/mix/deposit` | `{amount_sats, pubkey}` → invoice + commitment + leaf_index + merkle_root |
 | POST | `/v1/mix/payout` | `{commitment, root, nullifier_hash, pubkey, offer, fee_bps, signature}` → `release_at` |
 | GET | `/v1/mix/deposit/{commitment}` | state, amounts, release time |
@@ -123,7 +136,8 @@ Covers the lattice, official BIP340 sign/verify vectors, receipt and
 authorization binding, Merkle proofs, the full deposit→hold→payout state
 machine, offer reuse, fee tampering, invoice expiry, failed-payout retry,
 double-settlement guards, atomic offer queueing, journal-based crash
-recovery and real-payment-time holds.
+recovery, real-payment-time holds, backend selection and fail-closed RGB
+behavior.
 
 ## License
 

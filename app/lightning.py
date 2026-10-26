@@ -19,6 +19,8 @@ import socket
 import secrets
 import time
 
+from .assets import AssetSpec
+
 
 class BackendError(RuntimeError):
     pass
@@ -34,6 +36,15 @@ class CLNBackend:
     def __init__(self, rpc_path: str = "/root/.lightning/regtest/lightning-rpc"):
         self.rpc_path = rpc_path
         self._id = 0
+        self.spec = AssetSpec(
+            backend="btc-cln",
+            asset_id="btc",
+            network=os.environ.get("SWIRL_NETWORK", "regtest"),
+            amount_unit="sats",
+            enabled=True,
+            settlement="BOLT11 deposits; BOLT12 blinded-path payouts",
+            detail="Core Lightning JSON-RPC",
+        )
 
     def _roundtrip(self, method: str, params: dict):
         self._id += 1
@@ -125,6 +136,15 @@ class MockBackend:
         self._paid: dict[str, int] = {}
         self.payouts: list[dict] = []
         self.clock = time.time
+        self.spec = AssetSpec(
+            backend="btc-mock",
+            asset_id="btc",
+            network="mock",
+            amount_unit="sats",
+            enabled=True,
+            settlement="mock invoices and payouts; development only",
+            detail="in-memory BTC backend; never use with real funds",
+        )
 
     def create_invoice(self, amount_sats: int, label: str, description: str, expiry: int) -> str:
         return f"mockinv1{label}"
@@ -149,6 +169,15 @@ class MockBackend:
         return hashlib.sha256(b"mock-node").hexdigest()[:66]
 
 
-def from_env() -> "CLNBackend | MockBackend":
+def from_env():
+    """Select exactly one asset backend; unknown selections fail at startup."""
+    selected = os.environ.get("SWIRL_ASSET_BACKEND", "btc").strip().lower()
+    if selected == "rgb":
+        from .rgb import RGBBackend
+        return RGBBackend()
+    if selected != "btc":
+        raise ValueError(
+            f"unsupported SWIRL_ASSET_BACKEND={selected!r}; expected 'btc' or 'rgb'"
+        )
     rpc = os.environ.get("SWIRL_CLN_RPC", "")
     return CLNBackend(rpc) if rpc else MockBackend()

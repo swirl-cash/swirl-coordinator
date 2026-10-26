@@ -1,4 +1,4 @@
-"""Receipts and withdrawal authorizations — Tornado's input structure.
+"""SWIRL receipts and withdrawal authorization structure.
 
 Receipt (generated and kept on the user's device):
     SWIRL1-<amount_sats>-<seckey hex>
@@ -8,12 +8,11 @@ From the secret key we derive:
     nullifier     = sha256("SWIRL1/nullifier-seed" | sk)
     nullifierHash = sha256("SWIRL1/nullifier" | nullifier)
 
-Like Tornado, double-spending is prevented by the NULLIFIER SET, not by the
-deposit state machine: a withdrawal permanently burns nullifierHash.
+Double-spending is prevented by the NULLIFIER SET, not by the deposit state
+machine: a withdrawal permanently burns nullifierHash.
 
-The withdrawal authorization mirrors the public inputs of tornado's
-withdraw.circom — (root, nullifierHash, recipient, fee) — plus the direct
-mode's commitment:
+The authorization binds root, nullifierHash, recipient and fee, plus the
+direct mode's commitment:
     sha256("SWIRL1/withdraw" | commitment | root | nullifierHash |
            sha256(offer) | amount | fee_bps)
 Changing the root, destination or fee invalidates the signature. When the

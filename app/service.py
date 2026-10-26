@@ -19,7 +19,8 @@ import secrets
 import time
 from dataclasses import dataclass
 
-from . import lattice, merkle, receipts
+from . import __version__, lattice, merkle, receipts
+from .assets import AssetBackend
 from .lightning import BackendError
 from .store import Store
 
@@ -41,7 +42,8 @@ class Config:
 
 
 class Coordinator:
-    def __init__(self, store: Store, backend, config: Config | None = None,
+    def __init__(self, store: Store, backend: AssetBackend,
+                 config: Config | None = None,
                  randbelow=secrets.randbelow, clock=time.time):
         self.store = store
         self.backend = backend
@@ -53,20 +55,29 @@ class Coordinator:
         for c in self.store.leaves_in_order():
             self.tree.insert(c)
 
+    def _require_enabled(self):
+        if not self.backend.spec.enabled:
+            raise ServiceError(
+                "asset_backend_unavailable", self.backend.spec.detail, 503,
+            )
+
     # ── public params ────────────────────────────────────────
     def params(self) -> dict:
+        is_btc = self.backend.spec.asset_id == "btc"
         return {
-            "version": "0.3.0",
-            "lattice_sats": list(lattice.LATTICE),
+            "version": __version__,
+            "asset_backend": self.backend.spec.public(),
+            "lattice_sats": list(lattice.LATTICE) if is_btc else [],
             "fee_bps": self.cfg.fee_bps,
             "min_hold_seconds": self.cfg.min_hold,
             "exit_jitter_max_seconds": self.cfg.jitter_max,
             "invoice_expiry_seconds": self.cfg.invoice_expiry,
-            "settlement": "BOLT12 blinded paths, single-use offers",
+            "settlement": self.backend.spec.settlement,
         }
 
     # ── deposit ──────────────────────────────────────────────
     def create_deposit(self, amount_sats: int, pubkey_hex: str) -> dict:
+        self._require_enabled()
         try:
             lattice.check_quantum(amount_sats)
         except lattice.LatticeViolation as e:
@@ -124,6 +135,7 @@ class Coordinator:
     def authorize_payout(self, commitment: str, root: str, nullifier_hash: str,
                          pubkey_hex: str, offer: str,
                          fee_bps: int, signature_hex: str) -> dict:
+        self._require_enabled()
         d = self.store.get(commitment)
         if not d:
             raise ServiceError("unknown_commitment", "no such deposit", 404)
@@ -132,7 +144,7 @@ class Coordinator:
         if d["state"] == "QUEUED":
             raise ServiceError("already_queued", "payout already authorized", 409)
         if not self.store.is_known_root(root):
-            # tornado rule: only a recent root is acceptable
+            # only a root from the recent history is acceptable
             raise ServiceError("unknown_root",
                                "root is not in the recent root history", 409)
         if not offer or len(offer) > 1024 or any(c.isspace() for c in offer):

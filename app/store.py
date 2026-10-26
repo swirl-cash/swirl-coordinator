@@ -34,8 +34,8 @@ CREATE TABLE IF NOT EXISTS used_offers (
     offer_hash TEXT PRIMARY KEY,
     used_at    INTEGER NOT NULL
 );
--- permanent deposit leaves: settled deposits are NEVER removed (the
--- anonymity set only grows, exactly like Tornado's on-chain tree)
+-- permanent deposit leaves: settled deposits are NEVER removed, so the
+-- anonymity set only grows
 CREATE TABLE IF NOT EXISTS leaves (
     commitment  TEXT PRIMARY KEY,
     leaf_index  INTEGER UNIQUE NOT NULL,
