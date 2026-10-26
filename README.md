@@ -4,16 +4,17 @@ Non-custodial, fixed-denomination mixing over Lightning — **software anyone ca
 One coordinator is one node in the network; users can choose their coordinator,
 and federated settlement (shared anonymity sets) is the next milestone.
 
-**Status: v0.4.0 — regtest software. Do not use with real funds.**
-Core protocol logic is unit-tested (38 tests, including the official BIP340
-vectors); the CLN integration is written against the real JSON-RPC API and is
-exercised through the regtest stack below.
+**Status: v0.5.0 — pre-production reference software. Do not use with real funds.**
+53 automated tests cover the core protocol, held-HTLC refund/recovery paths,
+official BIP340 vectors, and HTTP smoke flows through a real uvicorn socket.
+The HTTP smoke tests use the in-memory mock; this release has **not yet been
+run against a real CLN regtest node** in the current build environment.
 The SWIRL core pool uses a permanent append-only Merkle tree, 30-root history
-and nullifier double-spend sets — see [docs/POOL.md](docs/POOL.md) for the
-mechanisms and trust boundaries.
-**Known trust gap:** once a deposit HTLC settles, a vanished coordinator
-cannot be forced to refund. The held-HTLC entry design that closes this is
-specified in [docs/REFUNDS.md](docs/REFUNDS.md) and is the next milestone.
+and nullifier double-spend sets — see [docs/POOL.md](docs/POOL.md).
+Held-HTLC entries are now implemented: the coordinator claims a deposit only
+after paying its authorized exit, and can cancel unresolved entries so their
+native Lightning timeout path returns funds. The remaining counterparty and
+liveness boundaries are stated in [docs/REFUNDS.md](docs/REFUNDS.md).
 
 ## What is enforced in code (not in a README)
 
@@ -24,7 +25,8 @@ specified in [docs/REFUNDS.md](docs/REFUNDS.md) and is the next milestone.
 | Fee and destination cannot be changed after signing | Payout authorization signs `(commitment, offer, amount, fee_bps)` together |
 | No instant in-and-out | 60 min minimum hold + up to 15 min random jitter, per deposit |
 | No address reuse | Every exit offer is single-use → `409 offer_reuse` |
-| No double settlement | Atomic compare-and-set state transitions, `SETTLING` guard, retry on failure |
+| No double settlement | Atomic compare-and-set transitions and an fsync'd journal; only definite failures retry, ambiguous payments enter `PAYOUT_REVIEW` |
+| Refundable entry | Optional held BOLT11 HTLCs; exit is paid before entry is claimed, with wall-clock + CLTV safety margins and explicit cancellation |
 | Verifiable anonymity set | Permanent append-only Merkle tree (20 levels), 30-root history, inclusion proofs — the set never shrinks on settlement |
 | Double-spend protection | Nullifier set, burned atomically with the payout queue — `409 already_spent` is final |
 | Destination hygiene | Plaintext offers are purged from the DB on settlement; secret keys are never transmitted or stored |
@@ -47,13 +49,18 @@ limiter and the operational model assume a single API process.
 
 ```bash
 pip install -r requirements.txt
+# Optional: exercise held-entry behavior with the in-memory mock.
+export SWIRL_HELD_HTLC=true
+export SWIRL_INVOICE_EXPIRY=7200  # must exceed hold + jitter + safety margin
 uvicorn app.main:app --port 8080 --no-access-log   # API
 python -m app.worker                               # payout worker, second shell
 ```
 
 Without `SWIRL_CLN_RPC` the node uses a mock Lightning backend so the full
 state machine can be exercised locally. Point `SWIRL_CLN_RPC` at a real CLN
-socket to go live on regtest.
+socket for regtest. The default hold, jitter and settlement safety margins are
+3600, 900 and 900 seconds; held mode rejects an invoice expiry that cannot
+cover their sum.
 
 ## Asset backends
 
@@ -68,16 +75,17 @@ databases, Merkle trees, nullifier sets and asset-specific denomination
 configuration. See [docs/ASSETS.md](docs/ASSETS.md) for the interface and the
 work required before RGB can be enabled.
 
-## Run the full regtest stack (bitcoind + CLN + coordinator)
+## Run the full regtest stack (bitcoind + CLN + hold plugin + coordinator)
 
 ```bash
 docker compose up -d --build
 bash scripts/regtest_smoke.sh
 ```
 
-The smoke test walks the entire flow: keygen → deposit → pay the invoice on
-regtest → sign a payout authorization → fresh BOLT12 offer → hold + jitter →
-settlement → Merkle inclusion proof.
+The smoke test walks keygen → held deposit → pay on regtest → signed payout →
+fresh BOLT12 offer → hold + jitter → exit payment → entry claim → Merkle proof,
+then repeats an entry and explicitly cancels it to reach `REFUNDED`. The CLN
+image pins hold plugin v0.3.3 and verifies its release-archive SHA-256.
 
 ## Use it as a user
 
@@ -116,28 +124,30 @@ coordinator) can authorize your exit.
 
 - **Today**: the coordinator operates the HTLCs and can refuse service, but it
   cannot forge your payout terms (signature-bound) and does not hold your
-  receipt key. Timing/amount correlation is reduced by the lattice, the hold
-  and jitter — a malicious coordinator can still observe its own logs, so run
-  your own or choose one you trust. **A settled deposit is not yet
-  force-refundable if the operator vanishes; see [docs/REFUNDS.md](docs/REFUNDS.md)
-  for the held-HTLC design that removes this assumption.**
-- **Next**: held-HTLC entries (timeout = automatic depositor refund), then
-  federated settlement rounds (merge commitment trees across
-  coordinators → one shared anonymity set), PTLC/adaptor-signature privacy,
-  and eventually BitVM-class trust minimization for large lanes.
+  receipt key. Timing/amount correlation is reduced by the lattice, hold and
+  jitter; a malicious coordinator can still observe its own logs. Held entries
+  can be cancelled or left to their native CLTV timeout. Entry and exit are not
+  atomic: the coordinator pays first and takes a bounded counterparty window.
+  Entry preimages require database/backup protection. See
+  [docs/REFUNDS.md](docs/REFUNDS.md) before any deployment.
+- **Next**: real-CLN validation of this release, then federated settlement
+  rounds (shared anonymity sets), PTLC/adaptor-signature privacy, and
+  eventually BitVM-class trust minimization for large lanes.
 
 ## Tests
 
 ```bash
 python -m unittest discover -s tests -v
+bash -n scripts/regtest_smoke.sh
+python -m compileall -q app tests
 ```
 
-Covers the lattice, official BIP340 sign/verify vectors, receipt and
-authorization binding, Merkle proofs, the full deposit→hold→payout state
-machine, offer reuse, fee tampering, invoice expiry, failed-payout retry,
-double-settlement guards, atomic offer queueing, journal-based crash
-recovery, real-payment-time holds, backend selection and fail-closed RGB
-behavior.
+The 53 tests cover the lattice, official BIP340 vectors, authorization
+binding, Merkle proofs, standard and held deposit→payout flows, cancellation
+and refunds, expiry safety, ambiguous-payment review, journal recovery, old
+DB migration, backend selection and fail-closed RGB behavior. Three HTTP
+smoke tests run through real uvicorn sockets with the in-memory mock. They
+do not replace the real-CLN Compose smoke test.
 
 ## License
 

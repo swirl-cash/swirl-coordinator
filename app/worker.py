@@ -20,6 +20,12 @@ def main(interval: float = 5.0):
         min_hold=int(os.environ.get("SWIRL_MIN_HOLD", "3600")),
         jitter_max=int(os.environ.get("SWIRL_JITTER_MAX", "900")),
         invoice_expiry=int(os.environ.get("SWIRL_INVOICE_EXPIRY", "3600")),
+        settlement_safety_seconds=int(
+            os.environ.get("SWIRL_SETTLEMENT_SAFETY_SECONDS", "900")
+        ),
+        settlement_safety_blocks=int(
+            os.environ.get("SWIRL_SETTLEMENT_SAFETY_BLOCKS", "12")
+        ),
     )
     coord = Coordinator(
         Store(os.environ.get("SWIRL_DB", "data/swirl.db")), from_env(), cfg,

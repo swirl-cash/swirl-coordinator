@@ -52,9 +52,14 @@ class TestRGBFailClosed(unittest.TestCase):
     def test_every_fund_moving_method_refuses(self):
         calls = (
             lambda: self.backend.create_invoice(1, "label", "description", 60),
+            lambda: self.backend.create_held_invoice(1, "label", "description", 60),
             lambda: self.backend.invoice_status("label"),
+            lambda: self.backend.held_invoice_status("ab" * 32),
             lambda: self.backend.invoice_paid("label"),
+            lambda: self.backend.settle_held_invoice("aa" * 32),
+            lambda: self.backend.cancel_held_invoice("ab" * 32),
             lambda: self.backend.pay_offer("lno1test", 1),
+            lambda: self.backend.block_height(),
             lambda: self.backend.node_uri(),
         )
         for call in calls:

@@ -1,16 +1,18 @@
 # Asset backends: BTC now, RGB behind an explicit boundary
 
 The protocol state machine consumes the `AssetBackend` interface in
-`app/assets.py`. The interface covers invoice creation, real payment-time
-lookup, BOLT12-style payout and node identity. Backend capabilities are
-published by `GET /v1/params` under `asset_backend`.
+`app/assets.py`. The interface covers standard and held-invoice creation,
+held-entry status/claim/cancellation, real payment-time lookup, BOLT12-style
+payout, block height and node identity. Backend capabilities are published by
+`GET /v1/params` under `asset_backend`.
 
 ## BTC
 
-`SWIRL_ASSET_BACKEND=btc` is the default. It preserves the existing CLN and
-mock implementations, sat-denominated fixed lanes and BOLT12 payouts. Without
-`SWIRL_CLN_RPC`, it uses the development mock and must not be used for real
-funds.
+`SWIRL_ASSET_BACKEND=btc` is the default, with sat-denominated fixed lanes and
+BOLT12 payouts. `SWIRL_HELD_HTLC=true` enables held BOLT11 entries in both CLN
+and the development mock. CLN requires the pinned hold plugin and a safe
+invoice-expiry configuration. Without `SWIRL_CLN_RPC`, the backend is the
+in-memory development mock and must not be used for real funds.
 
 ## RGB
 

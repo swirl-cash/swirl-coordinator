@@ -17,6 +17,7 @@ class RGBBackend:
     """Fail-closed placeholder for a future RGB-compatible Lightning node."""
 
     def __init__(self) -> None:
+        self.held_invoices_enabled = False
         asset_id = os.environ.get("SWIRL_RGB_ASSET_ID", "").strip()
         self.spec = AssetSpec(
             backend="rgb",
@@ -41,7 +42,16 @@ class RGBBackend:
         self._unavailable()
         raise AssertionError("unreachable")
 
+    def create_held_invoice(self, amount_sats: int, label: str,
+                            description: str, expiry: int):
+        self._unavailable()
+        raise AssertionError("unreachable")
+
     def invoice_status(self, label: str) -> tuple[bool, int | None]:
+        self._unavailable()
+        raise AssertionError("unreachable")
+
+    def held_invoice_status(self, payment_hash: str):
         self._unavailable()
         raise AssertionError("unreachable")
 
@@ -49,7 +59,17 @@ class RGBBackend:
         self._unavailable()
         raise AssertionError("unreachable")
 
+    def settle_held_invoice(self, preimage: str) -> None:
+        self._unavailable()
+
+    def cancel_held_invoice(self, payment_hash: str) -> None:
+        self._unavailable()
+
     def pay_offer(self, offer: str, amount_sats: int) -> str:
+        self._unavailable()
+        raise AssertionError("unreachable")
+
+    def block_height(self) -> int:
         self._unavailable()
         raise AssertionError("unreachable")
 

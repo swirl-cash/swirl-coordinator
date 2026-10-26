@@ -28,7 +28,12 @@ CREATE TABLE IF NOT EXISTS deposits (
     offer_hash   TEXT,
     fee_bps      INTEGER,
     payout_sats  INTEGER,
-    preimage     TEXT
+    preimage     TEXT,              -- exit payment proof
+    payment_hash TEXT,              -- held entry; NULL for legacy standard entries
+    entry_preimage TEXT,            -- claim secret, purged after entry settlement
+    entry_state  TEXT,              -- unpaid/accepted/paid/cancelled
+    entry_expiry INTEGER,           -- shortest accepted HTLC CLTV expiry (blocks)
+    entry_settled_at INTEGER
 );
 CREATE TABLE IF NOT EXISTS used_offers (
     offer_hash TEXT PRIMARY KEY,
@@ -70,6 +75,26 @@ class Store:
             self._conn.execute("PRAGMA journal_mode=WAL")
             self._conn.execute("PRAGMA busy_timeout=30000")
             self._conn.executescript(SCHEMA)
+            # SQLite does not add new columns through CREATE TABLE IF NOT
+            # EXISTS; migrate existing coordinator databases in place.
+            columns = {
+                row[1] for row in self._conn.execute(
+                    "PRAGMA table_info(deposits)"
+                ).fetchall()
+            }
+            migrations = {
+                "payment_hash": "TEXT",
+                "entry_preimage": "TEXT",
+                "entry_state": "TEXT",
+                "entry_expiry": "INTEGER",
+                "entry_settled_at": "INTEGER",
+            }
+            for name, sql_type in migrations.items():
+                if name not in columns:
+                    self._conn.execute(
+                        f"ALTER TABLE deposits ADD COLUMN {name} {sql_type}"
+                    )
+            self._conn.commit()
 
     def close(self):
         self._conn.close()
@@ -85,12 +110,16 @@ class Store:
 
     # ── deposits ─────────────────────────────────────────────
     def insert_deposit(self, d: dict):
+        fields = (
+            "commitment", "amount_sats", "pubkey", "state", "invoice",
+            "invoice_label", "created_at", "payment_hash", "entry_preimage",
+            "entry_state",
+        )
+        row = {name: d.get(name) for name in fields}
         self._q(
-            """INSERT INTO deposits
-               (commitment, amount_sats, pubkey, state, invoice, invoice_label, created_at)
-               VALUES (:commitment, :amount_sats, :pubkey, :state, :invoice,
-                       :invoice_label, :created_at)""",
-            d,
+            f"""INSERT INTO deposits ({', '.join(fields)})
+               VALUES ({', '.join(':' + name for name in fields)})""",
+            row,
         )
 
     def get(self, commitment: str) -> dict | None:

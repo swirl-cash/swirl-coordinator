@@ -1,6 +1,6 @@
 # SWIRL core pool model
 
-This document defines the pool mechanisms implemented in v0.4.0 and the trust
+This document defines the pool mechanisms implemented in v0.5.0 and the trust
 boundaries that remain explicit.
 
 ## Enforced mechanisms
@@ -36,8 +36,9 @@ proof, settle a payout or issue a refund.
   be versioned and tested end to end.
 - SWIRL allocation and governance are documented separately from settlement;
   reward accounting must not weaken receipt or nullifier isolation.
-- A settled Lightning deposit is not yet force-refundable if the operator
-  disappears. The held-HTLC entry design is documented in
-  [REFUNDS.md](REFUNDS.md).
+- Held-HTLC entries can remain unresolved until the authorized exit is paid;
+  cancellation and native CLTV timeout provide the refund path. Entry and exit
+  are not atomic: the operator has a bounded counterparty window, and ambiguous
+  payouts or lost entries require explicit review. See [REFUNDS.md](REFUNDS.md).
 - BTC and future RGB pools use separate databases, trees, nullifier sets and
   denominations. See [ASSETS.md](ASSETS.md).
