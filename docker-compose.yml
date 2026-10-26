@@ -1,0 +1,61 @@
+# Regtest reference stack: bitcoind + CLN + coordinator API + payout worker.
+# NO REAL FUNDS. For mainnet you would swap the network flags and lock down
+# the RPC paths — see README "Going to production" (not ready yet).
+services:
+  bitcoind:
+    image: bitcoin/bitcoin:28.0
+    command: >
+      -regtest -server -txindex
+      -rpcuser=swirl -rpcpassword=swirl
+      -rpcallowip=0.0.0.0/0 -rpcbind=0.0.0.0
+      -fallbackfee=0.00001
+    volumes:
+      - bitcoin-data:/home/bitcoin/.bitcoin
+
+  lightningd:
+    image: elementsproject/lightningd:v24.08.1
+    command: >
+      --network=regtest
+      --bitcoin-rpcconnect=bitcoind --bitcoin-rpcport=18443
+      --bitcoin-rpcuser=swirl --bitcoin-rpcpassword=swirl
+      --log-level=info --experimental-offers
+    volumes:
+      - lightning-data:/root/.lightning
+      - cln-rpc:/root/.lightning/regtest
+    depends_on:
+      - bitcoind
+
+  coordinator-api:
+    build: .
+    environment:
+      SWIRL_CLN_RPC: /cln/lightning-rpc
+      SWIRL_DB: /data/swirl.db
+      SWIRL_MIN_HOLD: "60"        # regtest only — production default is 3600
+      SWIRL_JITTER_MAX: "15"
+    volumes:
+      - coordinator-data:/data
+      - cln-rpc:/cln
+    ports:
+      - "8080:8080"
+    depends_on:
+      - lightningd
+
+  coordinator-worker:
+    build: .
+    command: python -m app.worker
+    environment:
+      SWIRL_CLN_RPC: /cln/lightning-rpc
+      SWIRL_DB: /data/swirl.db
+      SWIRL_MIN_HOLD: "60"
+      SWIRL_JITTER_MAX: "15"
+    volumes:
+      - coordinator-data:/data
+      - cln-rpc:/cln
+    depends_on:
+      - lightningd
+
+volumes:
+  bitcoin-data:
+  lightning-data:
+  cln-rpc:
+  coordinator-data:
