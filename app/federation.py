@@ -4,8 +4,9 @@ A federation round binds each coordinator's complete append-only local root.
 The combined tree orders snapshots by coordinator id and preserves each local
 leaf order, so every honest coordinator independently derives the same round.
 
-This stage shares anonymity sets only. Exits and nullifiers remain at the
-deposit's home coordinator; cross-coordinator exits are intentionally absent.
+Exits remain at the deposit's home coordinator. Before queueing, every peer
+must durably reserve the same nullifier; commits are retried after recovery.
+Cross-coordinator payment delegation and liquidity compensation remain absent.
 """
 
 from __future__ import annotations
@@ -14,6 +15,7 @@ import hashlib
 import json
 import os
 import re
+import urllib.error
 import urllib.request
 from dataclasses import dataclass
 from urllib.parse import urlparse
@@ -136,3 +138,44 @@ def round_id(snapshots: list[dict]) -> str:
         digest.update(identifier)
         digest.update(bytes.fromhex(snapshot["merkle_root"]))
     return digest.hexdigest()
+
+
+class FederationConflict(FederationError):
+    """A peer has already reserved or burned a conflicting nullifier."""
+
+
+def post_json(peer: str, path: str, payload: dict,
+              cfg: FederationConfig) -> dict:
+    """Small authenticated RPC used for nullifier prepare/commit/abort."""
+    req = urllib.request.Request(
+        peer + path,
+        data=json.dumps(payload, separators=(",", ":")).encode(),
+        method="POST",
+        headers={
+            "Content-Type": "application/json",
+            "X-SWIRL-Federation-Token": cfg.token,
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=8) as response:
+            raw = response.read(65_537)
+    except urllib.error.HTTPError as exc:
+        raw = exc.read(4096)
+        try:
+            error = json.loads(raw).get("error", "")
+        except (UnicodeDecodeError, json.JSONDecodeError, AttributeError):
+            error = ""
+        if exc.code == 409:
+            raise FederationConflict(error or "federation conflict") from exc
+        raise FederationError(f"federation RPC failed at {peer}: HTTP {exc.code}") from exc
+    except Exception as exc:
+        raise FederationError(f"federation RPC failed at {peer}: {exc}") from exc
+    if len(raw) > 65_536:
+        raise FederationError("federation RPC response is too large")
+    try:
+        result = json.loads(raw)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise FederationError("invalid federation RPC JSON") from exc
+    if not isinstance(result, dict):
+        raise FederationError("federation RPC response must be an object")
+    return result

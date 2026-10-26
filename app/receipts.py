@@ -86,14 +86,14 @@ def verify_authorization(commitment: str, root: str, nullifier_hash: str,
     try:
         pub = bytes.fromhex(pub_hex)
         sig = bytes.fromhex(sig_hex)
-    except ValueError:
+        if make_commitment(pub, amount_sats) != commitment:
+            return False
+        digest = auth_digest(
+            commitment, root, nullifier_hash, offer, amount_sats, fee_bps,
+        )
+    except (ValueError, TypeError, OverflowError):
         return False
-    if make_commitment(pub, amount_sats) != commitment:
-        return False
-    return schnorr.verify(
-        auth_digest(commitment, root, nullifier_hash, offer, amount_sats, fee_bps),
-        pub, sig,
-    )
+    return schnorr.verify(digest, pub, sig)
 
 
 def offer_hash(offer: str) -> str:

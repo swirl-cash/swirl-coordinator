@@ -3,6 +3,7 @@
 import secrets
 import unittest
 
+from app import federation as fed
 from app import merkle, receipts, schnorr
 from app.federation import FederationConfig
 from app.lightning import MockBackend
@@ -12,6 +13,7 @@ from app.store import Store
 Q = 1_000_000
 OFFER_A = "lno1-federation-exit-a"
 OFFER_B = "lno1-federation-exit-b"
+TOKEN = "test-federation-token"
 
 
 class FederationCase(unittest.TestCase):
@@ -22,7 +24,7 @@ class FederationCase(unittest.TestCase):
             cfg = FederationConfig(
                 coordinator_id=f"coordinator-{name}",
                 peers=(f"http://{name}.test",),
-                token="test-federation-token",
+                token=TOKEN,
                 allow_http=True,
             )
             self.coords[name] = Coordinator(
@@ -31,15 +33,36 @@ class FederationCase(unittest.TestCase):
                 randbelow=lambda n: 0,
                 federation_cfg=cfg,
                 snapshot_fetcher=self.fetch_snapshot,
+                federation_rpc=self.rpc,
             )
+
+    @staticmethod
+    def peer_name(peer):
+        return "b" if peer == "http://a.test" else "a"
 
     def fetch_snapshot(self, peer, cfg):
         del cfg
-        name = "b" if peer == "http://a.test" else "a"
-        return self.coords[name]._local_snapshot()
+        return self.coords[self.peer_name(peer)]._local_snapshot()
 
-    def paid_deposit(self, name):
-        sk = secrets.token_bytes(32)
+    def rpc(self, peer, path, payload, cfg):
+        """In-memory equivalent of post_json, including HTTP error mapping."""
+        target = self.coords[self.peer_name(peer)]
+        method = {
+            "/v1/federation/nullifier/reserve": target.federation_reserve,
+            "/v1/federation/nullifier/commit": target.federation_commit,
+            "/v1/federation/nullifier/abort": target.federation_abort,
+        }[path]
+        try:
+            return method(cfg.token, payload)
+        except ServiceError as exc:
+            if exc.http == 409:
+                raise fed.FederationConflict(exc.code) from exc
+            raise fed.FederationError(exc.code) from exc
+
+    def paid_deposit(self, name, receipt=None):
+        if receipt is None:
+            receipt = receipts.encode_receipt(secrets.token_bytes(32), Q)
+        sk, _ = receipts.decode_receipt(receipt)
         pk = schnorr.pubkey(sk)
         coord = self.coords[name]
         created = coord.create_deposit(Q, pk.hex())
@@ -47,7 +70,7 @@ class FederationCase(unittest.TestCase):
         self.backends[name].pay_invoice(f"swirl-{commitment[:40]}")
         coord.poll_invoices()
         self.assertEqual(coord.status(commitment)["state"], "HELD")
-        return receipts.encode_receipt(sk, Q), commitment
+        return receipt, commitment
 
     def sync_both(self):
         self.assertEqual(self.coords["a"].sync_federation(), [])
@@ -61,6 +84,15 @@ class FederationCase(unittest.TestCase):
         return coord.authorize_payout(
             commitment, root, nh, pk, offer, 50, sig,
         )
+
+    def nullifier_state(self, name, receipt):
+        sk, _ = receipts.decode_receipt(receipt)
+        nh = receipts.nullifier_hash_for(sk)
+        row = self.coords[name].store._q(
+            "SELECT state FROM federation_nullifiers WHERE nullifier_hash=?",
+            (nh,), "one",
+        )
+        return row["state"] if row else None
 
     def test_shared_root_proofs_and_home_coordinator_payouts(self):
         receipt_a, commitment_a = self.paid_deposit("a")
@@ -90,11 +122,140 @@ class FederationCase(unittest.TestCase):
             self.authorize("b", receipt_b, commitment_b, OFFER_B, root)["state"],
             "QUEUED",
         )
+        for name, receipt in (("a", receipt_a), ("b", receipt_b)):
+            self.assertEqual(self.nullifier_state(name, receipt), "COMMITTED")
+        self.assertEqual(self.nullifier_state("b", receipt_a), "COMMITTED")
+        self.assertEqual(self.nullifier_state("a", receipt_b), "COMMITTED")
 
         # A peer's deposit never becomes payable at the wrong home coordinator.
         with self.assertRaises(ServiceError) as cm:
             self.authorize("b", receipt_a, commitment_a, OFFER_A, root)
         self.assertEqual(cm.exception.code, "unknown_commitment")
+
+    def test_same_nullifier_cannot_queue_at_two_home_coordinators(self):
+        receipt, commitment = self.paid_deposit("a")
+        self.paid_deposit("b", receipt)
+        self.sync_both()
+        root = self.coords["a"].anonymity_set()["merkle_root"]
+
+        self.authorize("a", receipt, commitment, OFFER_A, root)
+        with self.assertRaises(ServiceError) as cm:
+            self.authorize("b", receipt, commitment, OFFER_B, root)
+        self.assertEqual(cm.exception.code, "already_spent")
+        self.assertEqual(self.coords["a"].status(commitment)["state"], "QUEUED")
+        self.assertEqual(self.coords["b"].status(commitment)["state"], "HELD")
+
+    def test_offline_peer_aborts_without_queueing(self):
+        receipt, commitment = self.paid_deposit("a")
+        self.paid_deposit("b")
+        self.sync_both()
+        root = self.coords["a"].anonymity_set()["merkle_root"]
+
+        def offline(peer, path, payload, cfg):
+            raise fed.FederationError("peer offline")
+
+        self.coords["a"]._federation_rpc = offline
+        with self.assertRaises(ServiceError) as cm:
+            self.authorize("a", receipt, commitment, OFFER_A, root)
+        self.assertEqual(cm.exception.code, "federation_authorization_failed")
+        self.assertEqual(self.coords["a"].status(commitment)["state"], "HELD")
+        self.assertIsNone(self.nullifier_state("a", receipt))
+        self.assertIsNone(self.nullifier_state("b", receipt))
+
+    def test_lost_reserve_response_still_aborts_peer_reservation(self):
+        receipt, commitment = self.paid_deposit("a")
+        self.paid_deposit("b")
+        self.sync_both()
+        root = self.coords["a"].anonymity_set()["merkle_root"]
+
+        def lost_response(peer, path, payload, cfg):
+            result = self.rpc(peer, path, payload, cfg)
+            if path.endswith("/reserve"):
+                raise fed.FederationError("response lost after durable reserve")
+            return result
+
+        self.coords["a"]._federation_rpc = lost_response
+        with self.assertRaises(ServiceError) as cm:
+            self.authorize("a", receipt, commitment, OFFER_A, root)
+        self.assertEqual(cm.exception.code, "federation_authorization_failed")
+        self.assertEqual(self.coords["a"].status(commitment)["state"], "HELD")
+        self.assertIsNone(self.nullifier_state("a", receipt))
+        self.assertIsNone(self.nullifier_state("b", receipt))
+
+    def test_commit_failure_retries_without_rolling_back_queue(self):
+        receipt, commitment = self.paid_deposit("a")
+        self.paid_deposit("b")
+        self.sync_both()
+        root = self.coords["a"].anonymity_set()["merkle_root"]
+        failed = []
+
+        def flaky_commit(peer, path, payload, cfg):
+            if path.endswith("/commit") and not failed:
+                failed.append(peer)
+                raise fed.FederationError("temporary commit failure")
+            return self.rpc(peer, path, payload, cfg)
+
+        self.coords["a"]._federation_rpc = flaky_commit
+        self.assertEqual(
+            self.authorize("a", receipt, commitment, OFFER_A, root)["state"],
+            "QUEUED",
+        )
+        self.assertEqual(self.nullifier_state("a", receipt), "COMMITTED")
+        self.assertEqual(self.nullifier_state("b", receipt), "RESERVED")
+
+        self.coords["a"]._federation_rpc = self.rpc
+        self.assertEqual(self.coords["a"].commit_federation_nullifiers(), [])
+        self.assertEqual(self.nullifier_state("b", receipt), "COMMITTED")
+        self.assertEqual(self.coords["a"].status(commitment)["state"], "QUEUED")
+
+    def test_stale_root_bad_signature_and_bad_proof_are_rejected(self):
+        receipt, commitment = self.paid_deposit("a")
+        self.sync_both()
+        old_root = self.coords["a"].anonymity_set()["merkle_root"]
+        self.paid_deposit("b")
+        self.sync_both()
+        root = self.coords["a"].anonymity_set()["merkle_root"]
+
+        with self.assertRaises(ServiceError) as cm:
+            self.authorize("a", receipt, commitment, OFFER_A, old_root)
+        self.assertEqual(cm.exception.code, "federation_root_stale")
+
+        pk, nh, sig = receipts.sign_authorization(
+            receipt, commitment, root, OFFER_A, 50,
+        )
+        with self.assertRaises(ServiceError) as cm:
+            self.coords["a"].authorize_payout(
+                commitment, root, nh, pk, OFFER_A, 50, "00" * 64,
+            )
+        self.assertEqual(cm.exception.code, "bad_signature")
+
+        proof = self.coords["a"].inclusion_proof(commitment)
+        payload = {
+            "commitment": commitment, "root": root, "nullifier_hash": nh,
+            "pubkey": pk, "offer": OFFER_A, "amount_sats": Q, "fee_bps": 50,
+            "signature": sig, "proof": proof["proof"], "origin": "coordinator-a",
+        }
+        payload["proof"][0]["sibling"] = "00" * 32
+        with self.assertRaises(ServiceError) as cm:
+            self.coords["b"].federation_reserve(TOKEN, payload)
+        self.assertEqual(cm.exception.code, "bad_federation_proof")
+        self.assertEqual(cm.exception.http, 422)
+        self.assertEqual(self.coords["a"].status(commitment)["state"], "HELD")
+
+    def test_federation_transition_requires_valid_token_and_fields(self):
+        payload = {
+            "nullifier_hash": "11" * 32,
+            "authorization_digest": "22" * 32,
+            "origin": "coordinator-a",
+        }
+        with self.assertRaises(ServiceError) as cm:
+            self.coords["b"].federation_commit("wrong-token", payload)
+        self.assertEqual(cm.exception.code, "federation_unauthorized")
+        payload["nullifier_hash"] = "not-hex"
+        with self.assertRaises(ServiceError) as cm:
+            self.coords["b"].federation_commit(TOKEN, payload)
+        self.assertEqual(cm.exception.code, "bad_federation_request")
+        self.assertEqual(cm.exception.http, 422)
 
     def test_snapshot_authentication_and_tamper_retains_last_good_round(self):
         self.paid_deposit("a")

@@ -225,7 +225,8 @@ class TestStoreMigration(unittest.TestCase):
             }
             self.assertTrue({
                 "payment_hash", "entry_preimage", "entry_state",
-                "entry_expiry", "entry_settled_at",
+                "entry_expiry", "entry_settled_at", "nullifier_hash",
+                "authorization_digest",
             }.issubset(columns))
             store.close()
 

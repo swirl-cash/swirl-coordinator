@@ -36,6 +36,8 @@ def main(interval: float = 5.0):
         try:
             for error in coord.sync_federation():
                 print(f"federation sync failed: {error}", flush=True)
+            for error in coord.commit_federation_nullifiers():
+                print(f"federation commit failed: {error}", flush=True)
             coord.poll_invoices()
             settled = coord.execute_due_payouts()
             for c in settled:

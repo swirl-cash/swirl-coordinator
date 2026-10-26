@@ -32,6 +32,25 @@ class PayoutReq(BaseModel):
     signature: str
 
 
+class FederationSpendReq(BaseModel):
+    commitment: str
+    root: str
+    nullifier_hash: str
+    pubkey: str
+    offer: str = Field(..., min_length=4, max_length=1024)
+    amount_sats: int = Field(..., gt=0)
+    fee_bps: int
+    signature: str
+    proof: list[dict]
+    origin: str
+
+
+class FederationNullifierReq(BaseModel):
+    nullifier_hash: str
+    authorization_digest: str
+    origin: str
+
+
 def build_app() -> FastAPI:
     cfg = Config(
         min_hold=int(os.environ.get("SWIRL_MIN_HOLD", "3600")),
@@ -102,6 +121,24 @@ def build_app() -> FastAPI:
     def federation_snapshot(request: Request):
         token = request.headers.get("X-SWIRL-Federation-Token", "")
         return coord.federation_snapshot(token)
+
+    @app.post("/v1/federation/nullifier/reserve")
+    def federation_reserve(req: FederationSpendReq, request: Request):
+        return coord.federation_reserve(
+            request.headers.get("X-SWIRL-Federation-Token", ""), req.model_dump(),
+        )
+
+    @app.post("/v1/federation/nullifier/commit")
+    def federation_commit(req: FederationNullifierReq, request: Request):
+        return coord.federation_commit(
+            request.headers.get("X-SWIRL-Federation-Token", ""), req.model_dump(),
+        )
+
+    @app.post("/v1/federation/nullifier/abort")
+    def federation_abort(req: FederationNullifierReq, request: Request):
+        return coord.federation_abort(
+            request.headers.get("X-SWIRL-Federation-Token", ""), req.model_dump(),
+        )
 
     @app.post("/v1/mix/deposit", status_code=201)
     def deposit(req: DepositReq):

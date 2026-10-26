@@ -28,6 +28,8 @@ CREATE TABLE IF NOT EXISTS deposits (
     offer_hash   TEXT,
     fee_bps      INTEGER,
     payout_sats  INTEGER,
+    nullifier_hash TEXT,            -- durable link for federation commit retries
+    authorization_digest TEXT,      -- exact signed statement approved by peers
     preimage     TEXT,              -- exit payment proof
     payment_hash TEXT,              -- held entry; NULL for legacy standard entries
     entry_preimage TEXT,            -- claim secret, purged after entry settlement
@@ -69,6 +71,22 @@ CREATE TABLE IF NOT EXISTS federation_rounds (
     root       TEXT UNIQUE NOT NULL,
     created_at INTEGER NOT NULL
 );
+-- N-of-N nullifier reservations: no automatic expiry after a prepare.
+CREATE TABLE IF NOT EXISTS federation_nullifiers (
+    nullifier_hash       TEXT PRIMARY KEY,
+    authorization_digest TEXT NOT NULL,
+    origin               TEXT NOT NULL,
+    state                TEXT NOT NULL,  -- RESERVED/COMMITTED
+    created_at           INTEGER NOT NULL,
+    committed_at         INTEGER
+);
+-- Home-side record of peers that durably acknowledged the commit.
+CREATE TABLE IF NOT EXISTS federation_commit_acks (
+    nullifier_hash TEXT NOT NULL,
+    peer           TEXT NOT NULL,
+    committed_at   INTEGER NOT NULL,
+    PRIMARY KEY (nullifier_hash, peer)
+);
 """
 
 # states in which a commitment is part of the live anonymity set
@@ -100,6 +118,8 @@ class Store:
                 "entry_state": "TEXT",
                 "entry_expiry": "INTEGER",
                 "entry_settled_at": "INTEGER",
+                "nullifier_hash": "TEXT",
+                "authorization_digest": "TEXT",
             }
             for name, sql_type in migrations.items():
                 if name not in columns:
@@ -230,17 +250,102 @@ class Store:
                 self._conn.execute("INSERT INTO roots (root) VALUES (?)", (root,))
             self._conn.commit()
 
+    # ── N-of-N federation nullifier prepare/commit ──────────
+    def reserve_federation_nullifier(self, nullifier_hash: str, digest: str,
+                                     origin: str) -> str:
+        with self._lock:
+            # The write lock also serializes API/worker processes sharing this DB.
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                row = self._conn.execute(
+                    "SELECT authorization_digest, origin, state FROM federation_nullifiers"
+                    " WHERE nullifier_hash=?", (nullifier_hash,),
+                ).fetchone()
+                if row:
+                    self._conn.execute("COMMIT")
+                    if row["authorization_digest"] == digest and row["origin"] == origin:
+                        return row["state"].lower()
+                    return "conflict"
+                self._conn.execute(
+                    "INSERT INTO federation_nullifiers"
+                    " (nullifier_hash, authorization_digest, origin, state, created_at)"
+                    " VALUES (?, ?, ?, 'RESERVED', ?)",
+                    (nullifier_hash, digest, origin, int(time.time())),
+                )
+                self._conn.execute("COMMIT")
+                return "reserved"
+            except Exception:
+                self._conn.execute("ROLLBACK")
+                raise
+
+    def commit_federation_nullifier(self, nullifier_hash: str, digest: str,
+                                    origin: str) -> bool:
+        with self._lock:
+            cur = self._conn.execute(
+                """UPDATE federation_nullifiers
+                   SET state='COMMITTED', committed_at=?
+                   WHERE nullifier_hash=? AND authorization_digest=? AND origin=?""",
+                (int(time.time()), nullifier_hash, digest, origin),
+            )
+            self._conn.commit()
+            return cur.rowcount == 1
+
+    def abort_federation_nullifier(self, nullifier_hash: str, digest: str,
+                                   origin: str) -> bool:
+        """Abort is possible only before the home coordinator queued the exit."""
+        with self._lock:
+            cur = self._conn.execute(
+                """DELETE FROM federation_nullifiers
+                   WHERE nullifier_hash=? AND authorization_digest=? AND origin=?
+                   AND state='RESERVED'""",
+                (nullifier_hash, digest, origin),
+            )
+            self._conn.commit()
+            return cur.rowcount == 1
+
+    def record_federation_commit_ack(self, nullifier_hash: str, peer: str):
+        self._q(
+            "INSERT OR IGNORE INTO federation_commit_acks VALUES (?, ?, ?)",
+            (nullifier_hash, peer, int(time.time())),
+        )
+
+    def federation_commit_acks(self, nullifier_hash: str) -> set[str]:
+        rows = self._q(
+            "SELECT peer FROM federation_commit_acks WHERE nullifier_hash=?",
+            (nullifier_hash,),
+        )
+        return {row["peer"] for row in rows}
+
+    def federation_authorizations(self) -> list[dict]:
+        return self._q(
+            """SELECT commitment, nullifier_hash, authorization_digest FROM deposits
+               WHERE nullifier_hash IS NOT NULL AND authorization_digest IS NOT NULL"""
+        )
+
     # ── payout queueing (single atomic transaction) ─────────
     def queue_payout(self, commitment: str, offer: str, offer_hash: str,
                      nullifier_hash: str,
-                     release_at: int, fee_bps: int, payout_sats: int) -> str:
+                     release_at: int, fee_bps: int, payout_sats: int,
+                     authorization_digest: str | None = None) -> str:
         """Burn the single-use offer AND the nullifier AND move HELD→QUEUED
-        atomically. Returns 'ok' | 'offer_reuse' | 'nullifier_spent' | 'state'.
-        If anything fails, NOTHING is burned and the deposit stays HELD.
+        atomically. Returns 'ok' | 'offer_reuse' | 'nullifier_spent' | 'state'
+        | 'federation_reservation_missing'. If anything fails, NOTHING is
+        burned and the deposit stays HELD.
         """
         with self._lock:
             try:
                 self._conn.execute("BEGIN IMMEDIATE")
+                if authorization_digest:
+                    reserved = self._conn.execute(
+                        """UPDATE federation_nullifiers
+                           SET state='COMMITTED', committed_at=?
+                           WHERE nullifier_hash=? AND authorization_digest=?
+                           AND state='RESERVED'""",
+                        (int(time.time()), nullifier_hash, authorization_digest),
+                    )
+                    if reserved.rowcount != 1:
+                        self._conn.execute("ROLLBACK")
+                        return "federation_reservation_missing"
                 if self._conn.execute(
                     "SELECT 1 FROM used_offers WHERE offer_hash=?", (offer_hash,)
                 ).fetchone():
@@ -254,9 +359,11 @@ class Store:
                 cur = self._conn.execute(
                     """UPDATE deposits
                        SET state='QUEUED', release_at=?, offer=?, offer_hash=?,
-                           fee_bps=?, payout_sats=?
+                           fee_bps=?, payout_sats=?, nullifier_hash=?,
+                           authorization_digest=?
                        WHERE commitment=? AND state='HELD'""",
-                    (release_at, offer, offer_hash, fee_bps, payout_sats, commitment),
+                    (release_at, offer, offer_hash, fee_bps, payout_sats,
+                     nullifier_hash, authorization_digest, commitment),
                 )
                 if cur.rowcount != 1:
                     self._conn.execute("ROLLBACK")

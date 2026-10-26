@@ -204,4 +204,17 @@ wait "$PAY_B_PID"
 PAY_B_PID=""
 "${PYTHON}" -m app.cli status --commitment "$COMMITMENT_A" --api "$API_A"
 "${PYTHON}" -m app.cli status --commitment "$COMMITMENT_B" --api "$API_B"
+
+echo "==> verify durable N-of-N nullifier commits on both databases"
+for service in coordinator-api coordinator-api-b; do
+  docker compose exec -T "$service" python -c '
+import sqlite3
+rows = sqlite3.connect("/data/swirl.db").execute(
+    "SELECT state FROM federation_nullifiers"
+).fetchall()
+assert len(rows) >= 2, rows
+assert all(state == "COMMITTED" for (state,) in rows), rows
+print(f"nullifier commits verified: {len(rows)}")
+'
+done
 echo "==> federation regtest passed: shared root $SHARED_ROOT"

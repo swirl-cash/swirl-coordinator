@@ -48,12 +48,18 @@ class Coordinator:
                  config: Config | None = None,
                  randbelow=secrets.randbelow, clock=time.time,
                  federation_cfg: fed.FederationConfig | None = None,
-                 snapshot_fetcher=fed.fetch_snapshot):
+                 snapshot_fetcher=fed.fetch_snapshot,
+                 federation_rpc=fed.post_json):
         self.store = store
         self.backend = backend
         self.cfg = config or Config()
         self.federation_cfg = federation_cfg
         self._snapshot_fetcher = snapshot_fetcher
+        self._federation_rpc = federation_rpc
+        import threading
+        # Serialize prepare/queue/abort per home API process. Without this, two
+        # identical concurrent requests could abort each other's reservations.
+        self._federation_authorization_lock = threading.Lock()
         self._federation_view: dict | None = None
         self.held_invoices = backend.held_invoices_enabled
         self._randbelow = randbelow
@@ -87,6 +93,7 @@ class Coordinator:
     # ── public params ────────────────────────────────────────
     def params(self) -> dict:
         is_btc = self.backend.spec.asset_id == "btc"
+        is_federated = bool(self.federation_cfg and self.federation_cfg.enabled)
         return {
             "version": __version__,
             "asset_backend": self.backend.spec.public(),
@@ -99,11 +106,13 @@ class Coordinator:
             "settlement_safety_blocks": self.cfg.settlement_safety_blocks,
             "settlement": self.backend.spec.settlement,
             "federation": {
-                "enabled": bool(self.federation_cfg and self.federation_cfg.enabled),
+                "enabled": is_federated,
                 "coordinator_id": self.federation_cfg.coordinator_id
                 if self.federation_cfg else "local",
                 "peer_count": len(self.federation_cfg.peers)
                 if self.federation_cfg else 0,
+                "authorization": "n-of-n" if is_federated else "local",
+                "current_root_required": is_federated,
             },
         }
 
@@ -122,6 +131,232 @@ class Coordinator:
         if not hmac.compare_digest(token, self.federation_cfg.token):
             raise ServiceError("federation_unauthorized", "invalid federation token", 401)
         return self._local_snapshot()
+
+    def _federation_token(self, token: str):
+        import hmac
+        if not self.federation_cfg or not self.federation_cfg.enabled:
+            raise ServiceError("federation_disabled", "federation is not enabled", 404)
+        if not hmac.compare_digest(token, self.federation_cfg.token):
+            raise ServiceError("federation_unauthorized", "invalid federation token", 401)
+
+    @staticmethod
+    def _check_federation_statement(data: dict) -> tuple[str, list[tuple[str, str]]]:
+        required = {
+            "commitment", "root", "nullifier_hash", "pubkey", "offer",
+            "amount_sats", "fee_bps", "signature", "proof", "origin",
+        }
+        if not required.issubset(data):
+            raise ServiceError("bad_federation_request", "missing spend fields", 422)
+        try:
+            if not fed.ID_RE.fullmatch(data["origin"]):
+                raise ValueError("invalid origin")
+            for field, length in (
+                ("commitment", 64), ("root", 64), ("nullifier_hash", 64),
+                ("pubkey", 64), ("signature", 128),
+            ):
+                value = data[field]
+                if not isinstance(value, str) or len(value) != length:
+                    raise ValueError(f"invalid {field}")
+                bytes.fromhex(value)
+            if (not isinstance(data["offer"], str)
+                    or not 4 <= len(data["offer"]) <= 1024
+                    or any(c.isspace() for c in data["offer"])):
+                raise ValueError("invalid offer")
+            if (not isinstance(data["amount_sats"], int)
+                    or isinstance(data["amount_sats"], bool)
+                    or not isinstance(data["fee_bps"], int)
+                    or isinstance(data["fee_bps"], bool)
+                    or not 0 <= data["fee_bps"] <= 0xFFFFFFFF):
+                raise ValueError("invalid numeric field")
+            proof = [(p["sibling"], p["side"]) for p in data["proof"]]
+            if any(side not in ("L", "R") or len(bytes.fromhex(sib)) != 32
+                   for sib, side in proof):
+                raise ValueError("invalid path element")
+            if not merkle.verify_path(data["commitment"], proof, data["root"]):
+                raise ValueError("invalid inclusion proof")
+            lattice.check_quantum(data["amount_sats"])
+            digest = receipts.auth_digest(
+                data["commitment"], data["root"], data["nullifier_hash"],
+                data["offer"], data["amount_sats"], data["fee_bps"],
+            ).hex()
+        except (ValueError, TypeError, KeyError, lattice.LatticeViolation) as exc:
+            raise ServiceError(
+                "bad_federation_proof", "invalid spend or inclusion proof", 422,
+            ) from exc
+        return digest, proof
+
+    @staticmethod
+    def _check_federation_nullifier(data: dict) -> tuple[str, str, str]:
+        try:
+            nh, digest, origin = (
+                data["nullifier_hash"], data["authorization_digest"], data["origin"],
+            )
+            for value in (nh, digest):
+                if not isinstance(value, str) or len(value) != 64:
+                    raise ValueError("invalid hash")
+                bytes.fromhex(value)
+            if not isinstance(origin, str) or not fed.ID_RE.fullmatch(origin):
+                raise ValueError("invalid origin")
+        except (ValueError, TypeError, KeyError) as exc:
+            raise ServiceError(
+                "bad_federation_request", "invalid nullifier transition", 422,
+            ) from exc
+        return nh, digest, origin
+
+    def federation_reserve(self, token: str, data: dict) -> dict:
+        """Verify and durably prepare one nullifier before the home can queue."""
+        self._federation_token(token)
+        digest, _ = self._check_federation_statement(data)
+        self._rebuild_federation()
+        if not self._federation_view or self._federation_view["merkle_root"] != data["root"]:
+            raise ServiceError(
+                "federation_root_stale", "peer requires the current shared root", 409,
+            )
+        if data["fee_bps"] != self.cfg.fee_bps:
+            raise ServiceError("fee_mismatch", "peer fee policy differs", 422)
+        if not receipts.verify_authorization(
+            data["commitment"], data["root"], data["nullifier_hash"],
+            data["pubkey"], data["signature"], data["offer"],
+            data["amount_sats"], data["fee_bps"],
+        ):
+            raise ServiceError("bad_signature", "invalid spend authorization", 401)
+        result = self.store.reserve_federation_nullifier(
+            data["nullifier_hash"], digest, data["origin"],
+        )
+        if result != "reserved":
+            raise ServiceError(
+                "already_spent", "nullifier is reserved or committed", 409,
+            )
+        return {
+            "approved": True, "state": result,
+            "coordinator_id": self.federation_cfg.coordinator_id,
+            "authorization_digest": digest,
+        }
+
+    def federation_commit(self, token: str, data: dict) -> dict:
+        self._federation_token(token)
+        nh, digest, origin = self._check_federation_nullifier(data)
+        committed = self.store.commit_federation_nullifier(nh, digest, origin)
+        if not committed:
+            raise ServiceError(
+                "unknown_reservation", "no matching federation reservation", 409,
+            )
+        return {"committed": True, "coordinator_id": self.federation_cfg.coordinator_id}
+
+    def federation_abort(self, token: str, data: dict) -> dict:
+        self._federation_token(token)
+        nh, digest, origin = self._check_federation_nullifier(data)
+        self.store.abort_federation_nullifier(nh, digest, origin)
+        return {"aborted": True}
+
+    def _abort_federation_prepare(self, peers: list[str], nullifier_hash: str,
+                                  digest: str):
+        payload = {
+            "nullifier_hash": nullifier_hash, "authorization_digest": digest,
+            "origin": self.federation_cfg.coordinator_id,
+        }
+        for peer in peers:
+            try:
+                self._federation_rpc(
+                    peer, "/v1/federation/nullifier/abort", payload,
+                    self.federation_cfg,
+                )
+            except Exception:
+                pass  # a stranded reservation fails closed; it never expires
+
+    def _prepare_federation(self, commitment: str, root: str, nullifier_hash: str,
+                            pubkey_hex: str, offer: str, amount_sats: int,
+                            fee_bps: int, signature_hex: str) -> str | None:
+        if not self.federation_cfg or not self.federation_cfg.enabled:
+            return None
+        proof = self.inclusion_proof(commitment)
+        if proof["merkle_root"] != root:
+            raise ServiceError(
+                "federation_root_stale",
+                "N-of-N authorization currently requires the current shared root", 409,
+            )
+        digest = receipts.auth_digest(
+            commitment, root, nullifier_hash, offer, amount_sats, fee_bps,
+        ).hex()
+        payload = {
+            "commitment": commitment, "root": root,
+            "nullifier_hash": nullifier_hash, "pubkey": pubkey_hex,
+            "offer": offer, "amount_sats": amount_sats, "fee_bps": fee_bps,
+            "signature": signature_hex, "proof": proof["proof"],
+            "origin": self.federation_cfg.coordinator_id,
+        }
+        origin = self.federation_cfg.coordinator_id
+        local = self.store.reserve_federation_nullifier(
+            nullifier_hash, digest, origin,
+        )
+        if local != "reserved":
+            raise ServiceError(
+                "already_spent", "this nullifier is reserved or committed", 409,
+            )
+        prepared = []
+        try:
+            for peer in self.federation_cfg.peers:
+                # Abort this peer on every failure, including a lost response
+                # after it durably reserved but before we received the ACK.
+                prepared.append(peer)
+                result = self._federation_rpc(
+                    peer, "/v1/federation/nullifier/reserve", payload,
+                    self.federation_cfg,
+                )
+                if (not isinstance(result, dict) or not result.get("approved")
+                        or result.get("authorization_digest") != digest
+                        or result.get("state") != "reserved"):
+                    raise fed.FederationError("peer returned an invalid approval")
+        except fed.FederationConflict as exc:
+            self._abort_federation_prepare(prepared, nullifier_hash, digest)
+            self.store.abort_federation_nullifier(nullifier_hash, digest, origin)
+            if str(exc) == "federation_root_stale":
+                raise ServiceError(
+                    "federation_root_stale", "a peer has not reached this root", 409,
+                ) from exc
+            if str(exc) != "already_spent":
+                raise ServiceError(
+                    "federation_authorization_failed",
+                    "a federation peer rejected the authorization", 503,
+                ) from exc
+            raise ServiceError(
+                "already_spent", "a federation peer rejected this nullifier", 409,
+            ) from exc
+        except Exception as exc:
+            self._abort_federation_prepare(prepared, nullifier_hash, digest)
+            self.store.abort_federation_nullifier(nullifier_hash, digest, origin)
+            raise ServiceError(
+                "federation_authorization_failed",
+                "all coordinators must approve before the exit can queue", 503,
+            ) from exc
+        return digest
+
+    def commit_federation_nullifiers(self) -> list[str]:
+        """Retry durable peer commits after queueing and after any crash."""
+        if not self.federation_cfg or not self.federation_cfg.enabled:
+            return []
+        errors = []
+        for d in self.store.federation_authorizations():
+            nh, digest = d["nullifier_hash"], d["authorization_digest"]
+            payload = {
+                "nullifier_hash": nh, "authorization_digest": digest,
+                "origin": self.federation_cfg.coordinator_id,
+            }
+            acked = self.store.federation_commit_acks(nh)
+            for peer in self.federation_cfg.peers:
+                if peer in acked:
+                    continue
+                try:
+                    result = self._federation_rpc(
+                        peer, "/v1/federation/nullifier/commit", payload,
+                        self.federation_cfg,
+                    )
+                    if not result.get("committed"):
+                        raise fed.FederationError("peer did not acknowledge commit")
+                    self.store.record_federation_commit_ack(nh, peer)
+                except Exception as exc:
+                    errors.append(f"{d['commitment']}@{peer}: {exc}")
+        return errors
 
     def sync_federation(self) -> list[str]:
         """Refresh authenticated peer snapshots; retain last good one on failure."""
@@ -327,17 +562,37 @@ class Coordinator:
                 raise ServiceError("entry_expiring",
                                    "not enough time remains for a safe exit", 409)
         payout = lattice.payout_amount(d["amount_sats"])
-        result = self.store.queue_payout(
-            commitment, offer, oh, nullifier_hash, release_at, fee_bps, payout,
-        )
-        if result == "offer_reuse":
-            raise ServiceError("offer_reuse",
-                               "every exit needs a fresh BOLT12 offer", 409)
-        if result == "nullifier_spent":
-            raise ServiceError("already_spent",
-                               "this note's nullifier has already been spent", 409)
-        if result != "ok":
-            raise ServiceError("already_queued", "payout already authorized", 409)
+        with self._federation_authorization_lock:
+            authorization_digest = self._prepare_federation(
+                commitment, root, nullifier_hash, pubkey_hex, offer,
+                d["amount_sats"], fee_bps, signature_hex,
+            )
+            result = self.store.queue_payout(
+                commitment, offer, oh, nullifier_hash, release_at, fee_bps, payout,
+                authorization_digest,
+            )
+            if result != "ok" and authorization_digest:
+                self._abort_federation_prepare(
+                    list(self.federation_cfg.peers), nullifier_hash, authorization_digest,
+                )
+                self.store.abort_federation_nullifier(
+                    nullifier_hash, authorization_digest,
+                    self.federation_cfg.coordinator_id,
+                )
+            if result == "offer_reuse":
+                raise ServiceError("offer_reuse",
+                                   "every exit needs a fresh BOLT12 offer", 409)
+            if result == "nullifier_spent":
+                raise ServiceError("already_spent",
+                                   "this note's nullifier has already been spent", 409)
+            if result == "federation_reservation_missing":
+                raise ServiceError(
+                    "federation_authorization_failed",
+                    "local federation reservation was not durable", 503,
+                )
+            if result != "ok":
+                raise ServiceError("already_queued", "payout already authorized", 409)
+            self.commit_federation_nullifiers()
         return {
             "commitment": commitment,
             "state": "QUEUED",
