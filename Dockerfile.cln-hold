@@ -1,6 +1,6 @@
 # CLN + Boltz hold plugin, pinned and checksum-verified for regtest.
 # The release asset is linux/amd64 only; build ARM from source instead.
-FROM elementsproject/lightningd:v24.08.1
+FROM elementsproject/lightningd:v25.09
 
 ARG HOLD_VERSION=v0.3.3
 ARG HOLD_SHA256=f9d916430fb70a3d75089f2d1b88d5d71d4987ef79933035978c1f44aab84be5

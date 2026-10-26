@@ -7,8 +7,8 @@ and federated settlement (shared anonymity sets) is the next milestone.
 **Status: v0.5.0 — pre-production reference software. Do not use with real funds.**
 53 automated tests cover the core protocol, held-HTLC refund/recovery paths,
 official BIP340 vectors, and HTTP smoke flows through a real uvicorn socket.
-The HTTP smoke tests use the in-memory mock; this release has **not yet been
-run against a real CLN regtest node** in the current build environment.
+The full Compose smoke test has also passed against CLN v25.09 + hold v0.3.3
+with independent payer/coordinator nodes and a real regtest channel.
 The SWIRL core pool uses a permanent append-only Merkle tree, 30-root history
 and nullifier double-spend sets — see [docs/POOL.md](docs/POOL.md).
 Held-HTLC entries are now implemented: the coordinator claims a deposit only
@@ -75,17 +75,19 @@ databases, Merkle trees, nullifier sets and asset-specific denomination
 configuration. See [docs/ASSETS.md](docs/ASSETS.md) for the interface and the
 work required before RGB can be enabled.
 
-## Run the full regtest stack (bitcoind + CLN + hold plugin + coordinator)
+## Run the full regtest stack (bitcoind + two CLN nodes + hold + coordinator)
 
 ```bash
 docker compose up -d --build
 bash scripts/regtest_smoke.sh
 ```
 
-The smoke test walks keygen → held deposit → pay on regtest → signed payout →
-fresh BOLT12 offer → hold + jitter → exit payment → entry claim → Merkle proof,
-then repeats an entry and explicitly cancels it to reach `REFUNDED`. The CLN
-image pins hold plugin v0.3.3 and verifies its release-archive SHA-256.
+The smoke script funds an independent payer, opens a real channel and seeds
+payout liquidity using regtest coins. It then walks keygen → held deposit →
+pay on regtest → signed payout → fresh BOLT12 offer → hold + jitter → exit
+payment → entry claim → Merkle proof, then repeats an entry and explicitly
+cancels it to reach `REFUNDED`. The CLN image pins hold plugin v0.3.3 and
+verifies its release-archive SHA-256. The API binds to localhost only.
 
 ## Use it as a user
 
@@ -130,15 +132,15 @@ coordinator) can authorize your exit.
   atomic: the coordinator pays first and takes a bounded counterparty window.
   Entry preimages require database/backup protection. See
   [docs/REFUNDS.md](docs/REFUNDS.md) before any deployment.
-- **Next**: real-CLN validation of this release, then federated settlement
-  rounds (shared anonymity sets), PTLC/adaptor-signature privacy, and
-  eventually BitVM-class trust minimization for large lanes.
+- **Next**: federated settlement rounds (shared anonymity sets),
+  PTLC/adaptor-signature privacy, and eventually BitVM-class trust
+  minimization for large lanes.
 
 ## Tests
 
 ```bash
 python -m unittest discover -s tests -v
-bash -n scripts/regtest_smoke.sh
+bash -n scripts/regtest_setup.sh scripts/regtest_smoke.sh
 python -m compileall -q app tests
 ```
 

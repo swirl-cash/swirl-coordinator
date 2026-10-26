@@ -20,12 +20,26 @@ services:
       --network=regtest
       --bitcoin-rpcconnect=bitcoind --bitcoin-rpcport=18443
       --bitcoin-rpcuser=swirl --bitcoin-rpcpassword=swirl
-      --log-level=info --experimental-offers
+      --log-level=info
       --important-plugin=/usr/local/bin/hold
       --hold-expiry-deadline=1 --hold-grpc-port=-1
     volumes:
       - lightning-data:/root/.lightning
       - cln-rpc:/root/.lightning/regtest
+    depends_on:
+      - bitcoind
+
+  payer:
+    build:
+      context: .
+      dockerfile: Dockerfile.cln-hold
+    command: >
+      --network=regtest
+      --bitcoin-rpcconnect=bitcoind --bitcoin-rpcport=18443
+      --bitcoin-rpcuser=swirl --bitcoin-rpcpassword=swirl
+      --log-level=info
+    volumes:
+      - payer-data:/root/.lightning
     depends_on:
       - bitcoind
 
@@ -44,7 +58,7 @@ services:
       - coordinator-data:/data
       - cln-rpc:/cln
     ports:
-      - "8080:8080"
+      - "127.0.0.1:8080:8080"
     depends_on:
       - lightningd
 
@@ -69,5 +83,6 @@ services:
 volumes:
   bitcoin-data:
   lightning-data:
+  payer-data:
   cln-rpc:
   coordinator-data:
