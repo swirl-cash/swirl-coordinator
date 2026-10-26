@@ -1,14 +1,16 @@
 # SWIRL Coordinator
 
 Non-custodial, fixed-denomination mixing over Lightning — **software anyone can run**.
-One coordinator is one node in the network; users can choose their coordinator,
-and federated settlement (shared anonymity sets) is the next milestone.
+One coordinator is one node in the network; users can choose their coordinator.
+Coordinators can exchange authenticated snapshots and independently derive a
+shared anonymity-set root while keeping exits at each deposit's home node.
 
-**Status: v0.5.0 — pre-production reference software. Do not use with real funds.**
-53 automated tests cover the core protocol, held-HTLC refund/recovery paths,
-official BIP340 vectors, and HTTP smoke flows through a real uvicorn socket.
-The full Compose smoke test has also passed against CLN v25.09 + hold v0.3.3
-with independent payer/coordinator nodes and a real regtest channel.
+**Status: v0.6.0 — pre-production reference software. Do not use with real funds.**
+57 automated tests cover the core protocol, federation rounds, held-HTLC
+refund/recovery paths, official BIP340 vectors, and HTTP smoke flows through a
+real uvicorn socket. The Compose smoke tests have passed against CLN v25.09 +
+hold v0.3.3, including two coordinators with independent nodes, channels and
+databases deriving one federation root and each completing a real regtest exit.
 The SWIRL core pool uses a permanent append-only Merkle tree, 30-root history
 and nullifier double-spend sets — see [docs/POOL.md](docs/POOL.md).
 Held-HTLC entries are now implemented: the coordinator claims a deposit only
@@ -28,6 +30,7 @@ liveness boundaries are stated in [docs/REFUNDS.md](docs/REFUNDS.md).
 | No double settlement | Atomic compare-and-set transitions and an fsync'd journal; only definite failures retry, ambiguous payments enter `PAYOUT_REVIEW` |
 | Refundable entry | Optional held BOLT11 HTLCs; exit is paid before entry is claimed, with wall-clock + CLTV safety margins and explicit cancellation |
 | Verifiable anonymity set | Permanent append-only Merkle tree (20 levels), 30-root history, inclusion proofs — the set never shrinks on settlement |
+| Shared federation rounds | Authenticated peer snapshots, deterministic combined roots and cross-peer proofs; payouts remain at the home coordinator |
 | Double-spend protection | Nullifier set, burned atomically with the payout queue — `409 already_spent` is final |
 | Destination hygiene | Plaintext offers are purged from the DB on settlement; secret keys are never transmitted or stored |
 | Crash-safe settlement | Every payment is appended to an fsync'd journal before the state flip; SETTLING rows reconcile automatically |
@@ -75,19 +78,26 @@ databases, Merkle trees, nullifier sets and asset-specific denomination
 configuration. See [docs/ASSETS.md](docs/ASSETS.md) for the interface and the
 work required before RGB can be enabled.
 
-## Run the full regtest stack (bitcoind + two CLN nodes + hold + coordinator)
+## Run the full regtest stack (bitcoind + CLN + two coordinators)
 
 ```bash
 docker compose up -d --build
-bash scripts/regtest_smoke.sh
+bash scripts/regtest_smoke.sh        # single-coordinator settle + refund
+bash scripts/regtest_federation.sh   # two coordinators, shared root, two exits
 ```
 
 The smoke script funds an independent payer, opens a real channel and seeds
 payout liquidity using regtest coins. It then walks keygen → held deposit →
 pay on regtest → signed payout → fresh BOLT12 offer → hold + jitter → exit
 payment → entry claim → Merkle proof, then repeats an entry and explicitly
-cancels it to reach `REFUNDED`. The CLN image pins hold plugin v0.3.3 and
-verifies its release-archive SHA-256. The API binds to localhost only.
+cancels it to reach `REFUNDED`.
+
+The federation script adds a second hold-enabled CLN node, coordinator and
+SQLite database. It pays one deposit at each coordinator, checks identical
+combined roots and cross-peer proofs, and settles one BOLT12 exit at each home
+coordinator. Federation configuration and its exact trust boundary are in
+[docs/FEDERATION.md](docs/FEDERATION.md). The CLN image pins hold plugin v0.3.3
+and verifies its release-archive SHA-256. Both APIs bind to localhost only.
 
 ## Use it as a user
 
@@ -118,8 +128,9 @@ coordinator) can authorize your exit.
 | POST | `/v1/mix/deposit` | `{amount_sats, pubkey}` → invoice + commitment + leaf_index + merkle_root |
 | POST | `/v1/mix/payout` | `{commitment, root, nullifier_hash, pubkey, offer, fee_bps, signature}` → `release_at` |
 | GET | `/v1/mix/deposit/{commitment}` | state, amounts, release time |
-| GET | `/v1/mix/set` | live anonymity-set size + Merkle root |
-| GET | `/v1/mix/proof/{commitment}` | Merkle inclusion proof |
+| GET | `/v1/mix/set` | permanent local/federated set size, root, scope and round id |
+| GET | `/v1/mix/proof/{commitment}` | local or cross-peer Merkle inclusion proof |
+| GET | `/v1/federation/snapshot` | authenticated local snapshot for configured peers |
 | GET | `/v1/health` | liveness |
 
 ## Trust model & roadmap
@@ -132,7 +143,10 @@ coordinator) can authorize your exit.
   atomic: the coordinator pays first and takes a bounded counterparty window.
   Entry preimages require database/backup protection. See
   [docs/REFUNDS.md](docs/REFUNDS.md) before any deployment.
-- **Next**: federated settlement rounds (shared anonymity sets),
+- **Federation today**: peers share validated snapshots and derive common
+  anonymity-set roots. They do not share nullifiers or perform atomic
+  cross-coordinator exits; see [docs/FEDERATION.md](docs/FEDERATION.md).
+- **Next**: signed coordinator identities and distributed exit authorization,
   PTLC/adaptor-signature privacy, and eventually BitVM-class trust
   minimization for large lanes.
 
@@ -140,16 +154,17 @@ coordinator) can authorize your exit.
 
 ```bash
 python -m unittest discover -s tests -v
-bash -n scripts/regtest_setup.sh scripts/regtest_smoke.sh
+bash -n scripts/regtest_setup.sh scripts/regtest_smoke.sh scripts/regtest_federation.sh
 python -m compileall -q app tests
 ```
 
-The 53 tests cover the lattice, official BIP340 vectors, authorization
-binding, Merkle proofs, standard and held deposit→payout flows, cancellation
-and refunds, expiry safety, ambiguous-payment review, journal recovery, old
-DB migration, backend selection and fail-closed RGB behavior. Three HTTP
-smoke tests run through real uvicorn sockets with the in-memory mock. They
-do not replace the real-CLN Compose smoke test.
+The 57 tests cover the lattice, official BIP340 vectors, authorization
+binding, Merkle proofs, deterministic federation rounds and tamper rejection,
+standard and held deposit→payout flows, cancellation and refunds, expiry
+safety, ambiguous-payment review, journal recovery, old DB migration, backend
+selection and fail-closed RGB behavior. Three HTTP smoke tests run through real
+uvicorn sockets with the in-memory mock. They do not replace the real-CLN
+Compose smoke tests.
 
 ## License
 

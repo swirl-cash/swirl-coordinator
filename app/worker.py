@@ -10,6 +10,7 @@ from __future__ import annotations
 import os
 import time
 
+from . import federation
 from .lightning import from_env
 from .service import Coordinator, Config
 from .store import Store
@@ -29,9 +30,12 @@ def main(interval: float = 5.0):
     )
     coord = Coordinator(
         Store(os.environ.get("SWIRL_DB", "data/swirl.db")), from_env(), cfg,
+        federation_cfg=federation.from_env(),
     )
     while True:
         try:
+            for error in coord.sync_federation():
+                print(f"federation sync failed: {error}", flush=True)
             coord.poll_invoices()
             settled = coord.execute_due_payouts()
             for c in settled:

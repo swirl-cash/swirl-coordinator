@@ -1,6 +1,6 @@
 # SWIRL core pool model
 
-This document defines the pool mechanisms implemented in v0.5.0 and the trust
+This document defines the pool mechanisms implemented in v0.6.0 and the trust
 boundaries that remain explicit.
 
 ## Enforced mechanisms
@@ -42,3 +42,7 @@ proof, settle a payout or issue a refund.
   payouts or lost entries require explicit review. See [REFUNDS.md](REFUNDS.md).
 - BTC and future RGB pools use separate databases, trees, nullifier sets and
   denominations. See [ASSETS.md](ASSETS.md).
+- Coordinators can combine authenticated local snapshots into deterministic
+  federation roots and serve cross-peer inclusion proofs. This release shares
+  anonymity sets only: deposits, nullifiers and payouts remain at the home
+  coordinator. See [FEDERATION.md](FEDERATION.md).

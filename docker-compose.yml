@@ -29,6 +29,23 @@ services:
     depends_on:
       - bitcoind
 
+  lightningd-b:
+    build:
+      context: .
+      dockerfile: Dockerfile.cln-hold
+    command: >
+      --network=regtest
+      --bitcoin-rpcconnect=bitcoind --bitcoin-rpcport=18443
+      --bitcoin-rpcuser=swirl --bitcoin-rpcpassword=swirl
+      --log-level=info
+      --important-plugin=/usr/local/bin/hold
+      --hold-expiry-deadline=1 --hold-grpc-port=-1
+    volumes:
+      - lightning-data-b:/root/.lightning
+      - cln-rpc-b:/root/.lightning/regtest
+    depends_on:
+      - bitcoind
+
   payer:
     build:
       context: .
@@ -45,7 +62,7 @@ services:
 
   coordinator-api:
     build: .
-    environment:
+    environment: &coordinator-a-env
       SWIRL_CLN_RPC: /cln/lightning-rpc
       SWIRL_DB: /data/swirl.db
       SWIRL_MIN_HOLD: "60"        # regtest only — production default is 3600
@@ -54,6 +71,10 @@ services:
       SWIRL_INVOICE_EXPIRY: "1800"
       SWIRL_SETTLEMENT_SAFETY_SECONDS: "120"
       SWIRL_SETTLEMENT_SAFETY_BLOCKS: "2"
+      SWIRL_FEDERATION_ID: coordinator-a
+      SWIRL_FEDERATION_PEERS: http://coordinator-api-b:8080
+      SWIRL_FEDERATION_TOKEN: regtest-only-federation-token
+      SWIRL_FEDERATION_ALLOW_HTTP: "true"
     volumes:
       - coordinator-data:/data
       - cln-rpc:/cln
@@ -65,7 +86,17 @@ services:
   coordinator-worker:
     build: .
     command: python -m app.worker
-    environment:
+    environment: *coordinator-a-env
+    volumes:
+      - coordinator-data:/data
+      - cln-rpc:/cln
+    depends_on:
+      - lightningd
+      - coordinator-api-b
+
+  coordinator-api-b:
+    build: .
+    environment: &coordinator-b-env
       SWIRL_CLN_RPC: /cln/lightning-rpc
       SWIRL_DB: /data/swirl.db
       SWIRL_MIN_HOLD: "60"
@@ -74,15 +105,35 @@ services:
       SWIRL_INVOICE_EXPIRY: "1800"
       SWIRL_SETTLEMENT_SAFETY_SECONDS: "120"
       SWIRL_SETTLEMENT_SAFETY_BLOCKS: "2"
+      SWIRL_FEDERATION_ID: coordinator-b
+      SWIRL_FEDERATION_PEERS: http://coordinator-api:8080
+      SWIRL_FEDERATION_TOKEN: regtest-only-federation-token
+      SWIRL_FEDERATION_ALLOW_HTTP: "true"
     volumes:
-      - coordinator-data:/data
-      - cln-rpc:/cln
+      - coordinator-data-b:/data
+      - cln-rpc-b:/cln
+    ports:
+      - "127.0.0.1:8081:8080"
     depends_on:
-      - lightningd
+      - lightningd-b
+
+  coordinator-worker-b:
+    build: .
+    command: python -m app.worker
+    environment: *coordinator-b-env
+    volumes:
+      - coordinator-data-b:/data
+      - cln-rpc-b:/cln
+    depends_on:
+      - lightningd-b
+      - coordinator-api
 
 volumes:
   bitcoin-data:
   lightning-data:
+  lightning-data-b:
   payer-data:
   cln-rpc:
+  cln-rpc-b:
   coordinator-data:
+  coordinator-data-b:

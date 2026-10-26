@@ -41,6 +41,8 @@ seed_liquidity() {
 
 wait_for_node lightningd
 wait_for_node payer
+COORD_ID=$(ln_cli lightningd getinfo | json_field id)
+ln_cli payer connect "$COORD_ID@lightningd:19846" >/dev/null || true
 
 if ln_cli payer listpeerchannels | "${PYTHON}" -c '
 import json, sys

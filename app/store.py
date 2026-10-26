@@ -57,6 +57,18 @@ CREATE TABLE IF NOT EXISTS nullifiers (
     nullifier_hash TEXT PRIMARY KEY,
     spent_at       INTEGER NOT NULL
 );
+-- authenticated local/peer snapshots used to derive shared Merkle rounds
+CREATE TABLE IF NOT EXISTS federation_snapshots (
+    coordinator_id TEXT PRIMARY KEY,
+    root           TEXT NOT NULL,
+    commitments    TEXT NOT NULL,
+    synced_at      INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS federation_rounds (
+    round_id   TEXT PRIMARY KEY,
+    root       TEXT UNIQUE NOT NULL,
+    created_at INTEGER NOT NULL
+);
 """
 
 # states in which a commitment is part of the live anonymity set
@@ -181,6 +193,42 @@ class Store:
         return self._q(
             "SELECT 1 AS x FROM (SELECT root FROM roots ORDER BY id DESC LIMIT 30)"
             " WHERE root=?", (root,), "one") is not None
+
+    # ── authenticated federation snapshots + shared roots ────
+    def upsert_federation_snapshot(self, coordinator_id: str, root: str,
+                                   commitments: list[str]):
+        import json
+        self._q(
+            """INSERT INTO federation_snapshots
+               (coordinator_id, root, commitments, synced_at) VALUES (?, ?, ?, ?)
+               ON CONFLICT(coordinator_id) DO UPDATE SET
+               root=excluded.root, commitments=excluded.commitments,
+               synced_at=excluded.synced_at""",
+            (coordinator_id, root, json.dumps(commitments, separators=(",", ":")),
+             int(time.time())),
+        )
+
+    def federation_snapshots(self) -> list[dict]:
+        import json
+        rows = self._q(
+            "SELECT coordinator_id, root, commitments FROM federation_snapshots"
+            " ORDER BY coordinator_id"
+        )
+        return [{
+            "coordinator_id": row["coordinator_id"],
+            "merkle_root": row["root"],
+            "commitments": json.loads(row["commitments"]),
+        } for row in rows]
+
+    def record_federation_root(self, round_id: str, root: str):
+        with self._lock:
+            cur = self._conn.execute(
+                "INSERT OR IGNORE INTO federation_rounds (round_id, root, created_at)"
+                " VALUES (?, ?, ?)", (round_id, root, int(time.time())),
+            )
+            if cur.rowcount == 1:
+                self._conn.execute("INSERT INTO roots (root) VALUES (?)", (root,))
+            self._conn.commit()
 
     # ── payout queueing (single atomic transaction) ─────────
     def queue_payout(self, commitment: str, offer: str, offer_hash: str,

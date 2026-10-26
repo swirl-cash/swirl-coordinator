@@ -19,7 +19,7 @@ import secrets
 import time
 from dataclasses import dataclass
 
-from . import __version__, lattice, merkle, receipts
+from . import __version__, federation as fed, lattice, merkle, receipts
 from .assets import AssetBackend
 from .lightning import BackendError, PaymentAmbiguous
 from .store import Store
@@ -46,10 +46,15 @@ class Config:
 class Coordinator:
     def __init__(self, store: Store, backend: AssetBackend,
                  config: Config | None = None,
-                 randbelow=secrets.randbelow, clock=time.time):
+                 randbelow=secrets.randbelow, clock=time.time,
+                 federation_cfg: fed.FederationConfig | None = None,
+                 snapshot_fetcher=fed.fetch_snapshot):
         self.store = store
         self.backend = backend
         self.cfg = config or Config()
+        self.federation_cfg = federation_cfg
+        self._snapshot_fetcher = snapshot_fetcher
+        self._federation_view: dict | None = None
         self.held_invoices = backend.held_invoices_enabled
         self._randbelow = randbelow
         self._clock = clock
@@ -66,6 +71,8 @@ class Coordinator:
         self.tree = merkle.AppendOnlyTree()
         for c in self.store.leaves_in_order():
             self.tree.insert(c)
+        if self.federation_cfg and self.federation_cfg.enabled:
+            self._rebuild_federation()
 
     def _require_enabled(self):
         if not self.backend.spec.enabled:
@@ -91,6 +98,82 @@ class Coordinator:
             "entry_mode": "held_htlc" if self.held_invoices else "standard",
             "settlement_safety_blocks": self.cfg.settlement_safety_blocks,
             "settlement": self.backend.spec.settlement,
+            "federation": {
+                "enabled": bool(self.federation_cfg and self.federation_cfg.enabled),
+                "coordinator_id": self.federation_cfg.coordinator_id
+                if self.federation_cfg else "local",
+                "peer_count": len(self.federation_cfg.peers)
+                if self.federation_cfg else 0,
+            },
+        }
+
+    # ── federated anonymity-set rounds ───────────────────────
+    def _local_snapshot(self) -> dict:
+        return {
+            "coordinator_id": self.federation_cfg.coordinator_id,
+            "commitments": self.store.leaves_in_order(),
+            "merkle_root": self.tree.root.hex(),
+        }
+
+    def federation_snapshot(self, token: str) -> dict:
+        import hmac
+        if not self.federation_cfg or not self.federation_cfg.enabled:
+            raise ServiceError("federation_disabled", "federation is not enabled", 404)
+        if not hmac.compare_digest(token, self.federation_cfg.token):
+            raise ServiceError("federation_unauthorized", "invalid federation token", 401)
+        return self._local_snapshot()
+
+    def sync_federation(self) -> list[str]:
+        """Refresh authenticated peer snapshots; retain last good one on failure."""
+        if not self.federation_cfg or not self.federation_cfg.enabled:
+            return []
+        errors = []
+        for peer in self.federation_cfg.peers:
+            try:
+                snapshot = self._snapshot_fetcher(peer, self.federation_cfg)
+                snapshot = fed.validate_snapshot(
+                    snapshot, self.federation_cfg.coordinator_id,
+                )
+                self.store.upsert_federation_snapshot(
+                    snapshot["coordinator_id"], snapshot["merkle_root"],
+                    snapshot["commitments"],
+                )
+            except Exception as exc:
+                errors.append(str(exc))
+        self._rebuild_federation()
+        return errors
+
+    def _rebuild_federation(self):
+        """Derive the same round independently from authenticated snapshots."""
+        if not self.federation_cfg or not self.federation_cfg.enabled:
+            self._federation_view = None
+            return
+        local = self._local_snapshot()
+        self.store.upsert_federation_snapshot(
+            local["coordinator_id"], local["merkle_root"], local["commitments"],
+        )
+        snapshots = self.store.federation_snapshots()
+        if len(snapshots) < 2:
+            self._federation_view = None
+            return
+
+        tree = merkle.AppendOnlyTree()
+        commitments = []
+        seen = set()
+        for snapshot in sorted(snapshots, key=lambda s: s["coordinator_id"]):
+            for commitment in snapshot["commitments"]:
+                if commitment in seen:
+                    continue  # the same receipt deposited twice is one member
+                seen.add(commitment)
+                commitments.append(commitment)
+                tree.insert(commitment)
+        round_id = fed.round_id(snapshots)
+        root = tree.root.hex()
+        self.store.record_federation_root(round_id, root)
+        self._federation_view = {
+            "tree": tree, "commitments": commitments,
+            "round_id": round_id, "merkle_root": root,
+            "coordinator_count": len(snapshots),
         }
 
     # ── deposit ──────────────────────────────────────────────
@@ -427,14 +510,40 @@ class Coordinator:
         }
 
     def anonymity_set(self) -> dict:
-        # the set is ALL deposits ever — it never shrinks on settlement
+        # every round is immutable; settled deposits are never removed
+        if self.federation_cfg and self.federation_cfg.enabled:
+            self._rebuild_federation()
+        if self._federation_view:
+            view = self._federation_view
+            return {
+                "size": view["tree"].next_index,
+                "merkle_root": view["merkle_root"],
+                "round_id": view["round_id"],
+                "scope": "federation",
+                "coordinator_count": view["coordinator_count"],
+                "root_history_size": merkle.ROOT_HISTORY_SIZE,
+            }
         return {
             "size": self.tree.next_index,
             "merkle_root": self.tree.root.hex(),
+            "scope": "local",
             "root_history_size": merkle.ROOT_HISTORY_SIZE,
         }
 
     def inclusion_proof(self, commitment: str) -> dict:
+        if self.federation_cfg and self.federation_cfg.enabled:
+            self._rebuild_federation()
+        if self._federation_view and commitment in self._federation_view["commitments"]:
+            view = self._federation_view
+            idx = view["commitments"].index(commitment)
+            prf = view["tree"].path(idx)
+            return {
+                "leaf_index": idx,
+                "merkle_root": view["merkle_root"],
+                "round_id": view["round_id"],
+                "scope": "federation",
+                "proof": [{"sibling": s, "side": side} for s, side in prf],
+            }
         idx = self.store.leaf_index(commitment)
         if idx is None:
             raise ServiceError("not_in_set", "commitment is not in the tree", 404)
@@ -442,5 +551,6 @@ class Coordinator:
         return {
             "leaf_index": idx,
             "merkle_root": self.tree.root.hex(),
+            "scope": "local",
             "proof": [{"sibling": s, "side": side} for s, side in prf],
         }

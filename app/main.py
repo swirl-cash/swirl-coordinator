@@ -11,7 +11,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
-from . import __version__
+from . import __version__, federation
 from .lightning import from_env
 from .service import Coordinator, Config, ServiceError
 from .store import Store
@@ -46,6 +46,7 @@ def build_app() -> FastAPI:
     )
     coord = Coordinator(
         Store(os.environ.get("SWIRL_DB", "data/swirl.db")), from_env(), cfg,
+        federation_cfg=federation.from_env(),
     )
     app = FastAPI(title="SWIRL coordinator", version=__version__)
     app.state.coord = coord
@@ -96,6 +97,11 @@ def build_app() -> FastAPI:
     @app.get("/v1/health")
     def health():
         return {"ok": True}
+
+    @app.get("/v1/federation/snapshot")
+    def federation_snapshot(request: Request):
+        token = request.headers.get("X-SWIRL-Federation-Token", "")
+        return coord.federation_snapshot(token)
 
     @app.post("/v1/mix/deposit", status_code=201)
     def deposit(req: DepositReq):

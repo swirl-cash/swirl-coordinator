@@ -1,6 +1,6 @@
 # Refund paths — custody and liveness boundaries
 
-## Implemented in v0.5.0: held-HTLC entries
+## Implemented in v0.6.0: held-HTLC entries
 
 BTC deposits can use held BOLT11 invoices (hodl-style entries) on today's
 Lightning. No soft fork or new cryptographic assumption is required.
@@ -72,8 +72,13 @@ user's receipt secret key is still never transmitted or stored.
 Unit tests cover full held settlement, cancellation, CLTV/wall-clock safety,
 nullifier behavior, ambiguous exits, claim failure and journal recovery.
 Real-uvicorn HTTP smoke tests exercise the same state machine with the mock
-backend. **A real CLN + hold-plugin regtest run is still required for this
-release; mock and RPC-shape tests are not a substitute for node validation.**
+backend. The full Compose test has passed against CLN v25.09 + hold v0.3.3 with
+real held payments reaching both `SETTLED` and `REFUNDED` on regtest.
+
+The v0.6.0 two-coordinator test also passed: independent nodes, channels and
+databases derived the same federation root, then each completed a BOLT12 exit
+and held-entry claim with final state `SETTLED`. These are regtest results, not
+mainnet or production-readiness claims.
 
 ## Alternative for large lanes: swap-in with a timelocked refund leg
 
