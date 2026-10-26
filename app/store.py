@@ -42,13 +42,15 @@ LIVE_STATES = ("HELD", "QUEUED", "SETTLING")
 
 class Store:
     def __init__(self, path: str):
+        self.path = path
         if path != ":memory:":
             os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
-        self._conn = sqlite3.connect(path, check_same_thread=False)
+        self._conn = sqlite3.connect(path, check_same_thread=False, timeout=30)
         self._conn.row_factory = sqlite3.Row
         self._lock = threading.Lock()
         with self._lock:
             self._conn.execute("PRAGMA journal_mode=WAL")
+            self._conn.execute("PRAGMA busy_timeout=30000")
             self._conn.executescript(SCHEMA)
 
     def close(self):
@@ -107,14 +109,40 @@ class Store:
             for r in self._q(f"SELECT commitment FROM deposits WHERE state IN ({marks})", LIVE_STATES)
         ]
 
-    # ── single-use offers ────────────────────────────────────
-    def claim_offer(self, offer_hash: str) -> bool:
-        """Returns False if this offer was ever used before."""
-        try:
-            self._q(
-                "INSERT INTO used_offers (offer_hash, used_at) VALUES (?, ?)",
-                (offer_hash, int(time.time())),
-            )
-            return True
-        except sqlite3.IntegrityError:
-            return False
+    # ── payout queueing (single atomic transaction) ─────────
+    def queue_payout(self, commitment: str, offer: str, offer_hash: str,
+                     release_at: int, fee_bps: int, payout_sats: int) -> str:
+        """Burn the single-use offer AND move HELD→QUEUED atomically.
+
+        BEGIN IMMEDIATE makes the check-and-write race-free across processes
+        (API + payout worker share this file; do not scale the API beyond
+        one process). Returns 'ok' | 'offer_reuse' | 'state'.
+        If anything fails, NOTHING is burned and the deposit stays HELD.
+        """
+        with self._lock:
+            try:
+                self._conn.execute("BEGIN IMMEDIATE")
+                if self._conn.execute(
+                    "SELECT 1 FROM used_offers WHERE offer_hash=?", (offer_hash,)
+                ).fetchone():
+                    self._conn.execute("ROLLBACK")
+                    return "offer_reuse"
+                cur = self._conn.execute(
+                    """UPDATE deposits
+                       SET state='QUEUED', release_at=?, offer=?, offer_hash=?,
+                           fee_bps=?, payout_sats=?
+                       WHERE commitment=? AND state='HELD'""",
+                    (release_at, offer, offer_hash, fee_bps, payout_sats, commitment),
+                )
+                if cur.rowcount != 1:
+                    self._conn.execute("ROLLBACK")
+                    return "state"
+                self._conn.execute(
+                    "INSERT INTO used_offers (offer_hash, used_at) VALUES (?, ?)",
+                    (offer_hash, int(time.time())),
+                )
+                self._conn.execute("COMMIT")
+                return "ok"
+            except Exception:
+                self._conn.execute("ROLLBACK")
+                raise

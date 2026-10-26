@@ -190,6 +190,7 @@ class TestCoordinator(unittest.TestCase):
     def setUp(self):
         self.clock = FakeClock()
         self.backend = MockBackend()
+        self.backend.clock = self.clock
         self.coord = Coordinator(
             Store(":memory:"), self.backend,
             Config(min_hold=3600, jitter_max=900),
@@ -316,6 +317,55 @@ class TestCoordinator(unittest.TestCase):
         self.assertEqual(self.coord.status(c)["state"], "QUEUED")
         self.backend.pay_offer = lambda offer, amount: "aa" * 32
         self.assertEqual(self.coord.execute_due_payouts(), [c])
+
+    def test_offer_not_burned_when_queue_fails(self):
+        # a deposit that never got paid cannot queue a payout, and the
+        # offer must survive untouched for later legitimate use
+        res = self._deposit(pay=False)
+        c = res["commitment"]
+        oh = receipts.offer_hash(OFFER1)
+        result = self.coord.store.queue_payout(c, OFFER1, oh, 0, 50, Q - 5000)
+        self.assertEqual(result, "state")
+        self.assertIsNone(self.coord.store._q(
+            "SELECT 1 FROM used_offers WHERE offer_hash=?", (oh,), "one"))
+        self.assertEqual(self.coord.status(c)["state"], "AWAITING_PAYMENT")
+
+    def test_settling_reconciled_from_journal(self):
+        import os
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            coord = Coordinator(
+                Store(os.path.join(tmp, "swirl.db")), self.backend,
+                Config(min_hold=3600, jitter_max=900),
+                randbelow=lambda n: 0, clock=self.clock,
+            )
+            res = coord.create_deposit(Q, self.pk_hex)
+            c = res["commitment"]
+            self.backend.pay_invoice(f"swirl-{c[:40]}")
+            coord.poll_invoices()
+            pk, sig = receipts.sign_authorization(self.receipt, c, OFFER1, 50)
+            coord.authorize_payout(c, pk, OFFER1, 50, sig)
+            self.clock.t += 3601
+            # simulate the crash window: node paid, DB still SETTLING
+            self.assertTrue(coord.store.transition(c, "QUEUED", "SETTLING"))
+            coord._journal_append({"commitment": c, "preimage": "bb" * 32,
+                                   "amount_sats": Q - 5000, "at": self.clock.t})
+            coord.reconcile_settling()
+            self.assertEqual(coord.status(c)["state"], "SETTLED")
+            self.assertEqual(coord.store.get(c)["preimage"], "bb" * 32)
+            self.assertIsNone(coord.store.get(c)["offer"])
+            coord.store.close()
+
+    def test_hold_uses_real_payment_time(self):
+        res = self._deposit(pay=False)
+        c = res["commitment"]
+        self.clock.t += 120  # poller notices the payment 2 min late
+        self.backend.pay_invoice(f"swirl-{c[:40]}")
+        self.clock.t += 120
+        self.coord.poll_invoices()
+        # paid_at must be the payment time, not the poll time
+        self.assertEqual(self.coord.status(c)["paid_at"],
+                         self.coord.status(c)["created_at"] + 120)
 
 
 if __name__ == "__main__":

@@ -14,6 +14,7 @@ Enforced here, not in documentation:
 
 from __future__ import annotations
 
+import os
 import secrets
 import time
 from dataclasses import dataclass
@@ -51,7 +52,7 @@ class Coordinator:
     # ── public params ────────────────────────────────────────
     def params(self) -> dict:
         return {
-            "version": "0.1.0",
+            "version": "0.2.0",
             "lattice_sats": list(lattice.LATTICE),
             "fee_bps": self.cfg.fee_bps,
             "min_hold_seconds": self.cfg.min_hold,
@@ -103,9 +104,12 @@ class Coordinator:
             if now > d["created_at"] + self.cfg.invoice_expiry:
                 self.store.transition(d["commitment"], "AWAITING_PAYMENT", "EXPIRED")
                 continue
-            if self.backend.invoice_paid(d["invoice_label"]):
+            status = self.backend.invoice_status(d["invoice_label"])
+            if status[0]:
+                # hold starts at the node's real payment time, not poll time
                 self.store.transition(
-                    d["commitment"], "AWAITING_PAYMENT", "HELD", paid_at=now,
+                    d["commitment"], "AWAITING_PAYMENT", "HELD",
+                    paid_at=status[1] or now,
                 )
 
     # ── payout authorization ─────────────────────────────────
@@ -130,18 +134,16 @@ class Coordinator:
                                "authorization does not match commitment/offer/fee", 401)
 
         oh = receipts.offer_hash(offer)
-        if not self.store.claim_offer(oh):
-            raise ServiceError("offer_reuse",
-                               "every exit needs a fresh BOLT12 offer", 409)
-
         jitter = self._randbelow(self.cfg.jitter_max + 1) if self.cfg.jitter_max else 0
         release_at = d["paid_at"] + self.cfg.min_hold + jitter
         payout = lattice.payout_amount(d["amount_sats"])
-        if not self.store.transition(
-            commitment, "HELD", "QUEUED",
-            release_at=release_at, offer=offer, offer_hash=oh,
-            fee_bps=fee_bps, payout_sats=payout,
-        ):
+        result = self.store.queue_payout(
+            commitment, offer, oh, release_at, fee_bps, payout,
+        )
+        if result == "offer_reuse":
+            raise ServiceError("offer_reuse",
+                               "every exit needs a fresh BOLT12 offer", 409)
+        if result != "ok":
             raise ServiceError("already_queued", "payout already authorized", 409)
         return {
             "commitment": commitment,
@@ -151,10 +153,59 @@ class Coordinator:
             "fee_sats": lattice.fee_for(d["amount_sats"]),
         }
 
+    # ── settlement journal (crash recovery) ─────────────────
+    # If the DB write fails AFTER the node paid, the preimage must not die
+    # with the process. Every successful payment is appended to an
+    # append-only journal BEFORE the state flip; on the next worker round
+    # any SETTLING row found in the journal is reconciled to SETTLED.
+    @property
+    def _journal_path(self) -> str | None:
+        return None if self.store.path == ":memory:" else self.store.path + ".settlements"
+
+    def _journal_append(self, entry: dict):
+        path = self._journal_path
+        if not path:
+            return
+        import json
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(entry) + "\n")
+            f.flush()
+            os.fsync(f.fileno())
+
+    def _journal_preimages(self) -> dict[str, str]:
+        path = self._journal_path
+        out: dict[str, str] = {}
+        if not path or not os.path.exists(path):
+            return out
+        import json
+        with open(path, encoding="utf-8") as f:
+            for line in f:
+                try:
+                    e = json.loads(line)
+                    out[e["commitment"]] = e["preimage"]
+                except (ValueError, KeyError):
+                    continue
+        return out
+
+    def reconcile_settling(self):
+        """Recover payouts that settled on the node but not in the DB.
+        Rows still in SETTLING without a journal entry are left untouched —
+        reconciled against listpays by an operator, never blindly repaid."""
+        journal = self._journal_preimages()
+        for d in self.store.by_state("SETTLING"):
+            preimage = journal.get(d["commitment"])
+            if preimage:
+                self.store.transition(
+                    d["commitment"], "SETTLING", "SETTLED",
+                    preimage=preimage, offer=None,
+                )
+                print(f"reconciled {d['commitment']} from settlement journal", flush=True)
+
     def execute_due_payouts(self):
         """Worker step: settle every QUEUED deposit whose hold has elapsed.
         Plaintext offers are read from the queue row and purged on settlement.
         """
+        self.reconcile_settling()
         now = int(self._clock())
         settled = []
         for d in self.store.by_state("QUEUED"):
@@ -167,9 +218,15 @@ class Coordinator:
                     raise BackendError("no offer available for payout")
                 preimage = self.backend.pay_offer(d["offer"], d["payout_sats"])
             except Exception:
-                # never mark settled on failure — retry next worker round
+                # the payment did not go through — safe to retry next round
                 self.store.transition(d["commitment"], "SETTLING", "QUEUED")
                 continue
+            # journal first: even if the DB write now fails, the preimage
+            # survives and reconcile_settling() will finish the job
+            self._journal_append({
+                "commitment": d["commitment"], "preimage": preimage,
+                "amount_sats": d["payout_sats"], "at": now,
+            })
             self.store.transition(
                 d["commitment"], "SETTLING", "SETTLED",
                 preimage=preimage, offer=None,

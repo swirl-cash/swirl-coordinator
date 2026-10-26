@@ -38,13 +38,47 @@ def build_app() -> FastAPI:
     coord = Coordinator(
         Store(os.environ.get("SWIRL_DB", "data/swirl.db")), from_env(), cfg,
     )
-    app = FastAPI(title="SWIRL coordinator", version="0.1.0")
+    app = FastAPI(title="SWIRL coordinator", version="0.2.0")
     app.state.coord = coord
 
     @app.exception_handler(ServiceError)
     async def service_error(_: Request, e: ServiceError):
         return JSONResponse(status_code=e.http,
                             content={"error": e.code, "message": e.message})
+
+    # ── edge hardening: body cap + per-IP sliding-window rate limit ──
+    # Single-process in-memory limiter (the API is one process by design).
+    # Behind a reverse proxy, also enforce limits there and pass a trusted
+    # client-IP header; do not trust X-Forwarded-For blindly here.
+    import threading
+    import time as _time
+    from collections import defaultdict, deque
+
+    _hits: dict[str, deque] = defaultdict(deque)
+    _hits_lock = threading.Lock()
+
+    @app.middleware("http")
+    async def edge_guard(request: Request, call_next):
+        if request.method in ("POST", "PUT", "PATCH"):
+            cl = request.headers.get("content-length")
+            if cl and cl.isdigit() and int(cl) > 32 * 1024:
+                return JSONResponse(status_code=413,
+                                    content={"error": "body_too_large"})
+            bucket, limit = "w", 30      # 30 writes/min/IP
+        else:
+            bucket, limit = "r", 120     # 120 reads/min/IP
+        ip = request.client.host if request.client else "unknown"
+        key = f"{bucket}:{ip}"
+        now = _time.monotonic()
+        with _hits_lock:
+            q = _hits[key]
+            while q and now - q[0] > 60:
+                q.popleft()
+            if len(q) >= limit:
+                return JSONResponse(status_code=429,
+                                    content={"error": "rate_limited"})
+            q.append(now)
+        return await call_next(request)
 
     @app.get("/v1/params")
     def params():

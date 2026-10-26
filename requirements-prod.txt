@@ -1,0 +1,3 @@
+# Optional but recommended for production: constant-time audited
+# libsecp256k1 bindings. The coordinator auto-detects them.
+coincurve>=19

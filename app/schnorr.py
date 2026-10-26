@@ -121,3 +121,30 @@ def verify(msg32: bytes, pub: bytes, sig: bytes) -> bool:
     if rt is None or rt[1] % 2 != 0 or rt[0] != r:
         return False
     return True
+
+
+# ── optional libsecp256k1 backend ───────────────────────────
+# The pure-Python code above is for regtest and reference: it is NOT
+# constant-time. Install `coincurve` (bindings to the audited
+# libsecp256k1) and these names transparently switch to constant-time
+# native implementations. Same API, same official test vectors.
+try:
+    from coincurve import PrivateKey as _CCKey, PublicKeyXOnly as _CCXOnly
+    _HAS_CC = hasattr(_CCKey, "sign_schnorr")
+except Exception:  # coincurve not installed
+    _HAS_CC = False
+
+if _HAS_CC:
+    pubkey_pure, sign_pure, verify_pure = pubkey, sign, verify
+
+    def pubkey(seckey: bytes) -> bytes:  # type: ignore[no-redef]
+        return bytes(_CCKey(seckey).public_key.format(compressed=True)[1:])
+
+    def sign(msg32: bytes, seckey: bytes, aux_rand: bytes | None = None) -> bytes:  # type: ignore[no-redef]
+        return _CCKey(seckey).sign_schnorr(msg32, aux_rand or secrets.token_bytes(32))
+
+    def verify(msg32: bytes, pub: bytes, sig: bytes) -> bool:  # type: ignore[no-redef]
+        try:
+            return bool(_CCXOnly(pub).verify(sig, msg32))
+        except Exception:
+            return False
